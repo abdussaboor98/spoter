@@ -319,13 +319,31 @@ def _interpolate_pair(values: Sequence[Point], position: float) -> Point:
 
     lower_index = int(np.floor(position))
     upper_index = min(lower_index + 1, len(values) - 1)
-    weight = position - lower_index
 
-    lower_point = values[lower_index]
-    upper_point = values[upper_index]
+    def _find_valid(start: int, direction: int) -> Tuple[int | None, Point | None]:
+        index = start
+        while 0 <= index < len(values):
+            point = values[index]
+            if point != (0.0, 0.0):
+                return index, point
+            index += direction
+        return None, None
 
-    if lower_index == upper_index or lower_point == upper_point:
+    lower_idx, lower_point = _find_valid(lower_index, -1)
+    upper_idx, upper_point = _find_valid(upper_index, 1)
+
+    if lower_point is None and upper_point is None:
+        return 0.0, 0.0
+    if lower_point is None:
+        return upper_point  # type: ignore[return-value]
+    if upper_point is None:
         return lower_point
+
+    if lower_idx == upper_idx or lower_point == upper_point:
+        return lower_point
+
+    distance = max(upper_idx - lower_idx, 1)
+    weight = np.clip((position - lower_idx) / distance, 0.0, 1.0)
 
     x = (1 - weight) * lower_point[0] + weight * upper_point[0]
     y = (1 - weight) * lower_point[1] + weight * upper_point[1]
