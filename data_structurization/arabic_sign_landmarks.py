@@ -62,10 +62,17 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
+import time
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Mapping, MutableMapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
+
+from itertools import chain
+from multiprocessing import Manager
+from queue import Empty
 
 import cv2
 import mediapipe as mp
@@ -73,12 +80,21 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+# Ensure repository root is on sys.path when the script is executed directly.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from normalization.body_normalization import BODY_IDENTIFIERS
 from normalization.hand_normalization import HAND_IDENTIFIERS as HAND_BASE_IDENTIFIERS
 
 # Type aliases for readability
 Point = Tuple[float, float]
 SequenceDict = Dict[str, List[Point]]
+MetadataValue = str | int | float
+RowDict = Dict[str, MetadataValue]
+UserRows = MutableMapping[str, List[RowDict]]
+RowsByAugmentation = Dict[str, UserRows]
 
 
 # MediaPipe helpers ---------------------------------------------------------
@@ -152,6 +168,7 @@ METADATA_COLUMNS: Sequence[str] = (
     "repetition",
     "labels",
     "frame_count",
+    "extraction_time_sec",
     "video_path",
 )
 
@@ -346,8 +363,8 @@ def resample_sequence(sequence: SequenceDict, speed_factor: float) -> SequenceDi
     return resampled
 
 
-def sequence_to_row(sequence: SequenceDict, metadata: Mapping[str, str | int]) -> Dict[str, str | int]:
-    row: Dict[str, str | int] = dict(metadata)
+def sequence_to_row(sequence: SequenceDict, metadata: Mapping[str, MetadataValue]) -> RowDict:
+    row: RowDict = dict(metadata)
 
     if sequence:
         example_key = next(iter(sequence))
@@ -374,6 +391,7 @@ class ExtractionConfig:
     min_visibility: float
     speed_up_factor: float
     slow_down_factor: float
+    workers: int
 
 
 def discover_videos(dataset_root: Path) -> List[Path]:
@@ -381,7 +399,7 @@ def discover_videos(dataset_root: Path) -> List[Path]:
     return [path for path in video_paths if path.is_file()]
 
 
-def _metadata_from_path(dataset_root: Path, video_path: Path) -> Dict[str, str | int]:
+def _metadata_from_path(dataset_root: Path, video_path: Path) -> Dict[str, MetadataValue]:
     relative_path = video_path.relative_to(dataset_root)
     try:
         user_id, gesture_id, video_name = relative_path.parts
@@ -402,6 +420,18 @@ def _metadata_from_path(dataset_root: Path, video_path: Path) -> Dict[str, str |
     }
 
 
+def group_videos_by_user(dataset_root: Path, video_paths: Sequence[Path]) -> Dict[str, List[Path]]:
+    grouped: Dict[str, List[Path]] = defaultdict(list)
+    for path in video_paths:
+        relative_path = path.relative_to(dataset_root)
+        try:
+            user_id = relative_path.parts[0]
+        except IndexError as exc:
+            raise ValueError(f"Unexpected directory layout for video '{path}'.") from exc
+        grouped[user_id].append(path)
+    return dict(grouped)
+
+
 def ensure_output_directories(output_root: Path) -> Mapping[str, Path]:
     subdirs = {
         "original": output_root / "original",
@@ -416,8 +446,117 @@ def ensure_output_directories(output_root: Path) -> Mapping[str, Path]:
     return subdirs
 
 
+def _initialize_rows_container() -> RowsByAugmentation:
+    return {
+        "original": defaultdict(list),
+        "flipped": defaultdict(list),
+        "speed_up": defaultdict(list),
+        "slow_down": defaultdict(list),
+    }
+
+
+def _append_rows_for_sequences(
+    rows_by_augmentation: RowsByAugmentation,
+    metadata: Mapping[str, MetadataValue],
+    base_sequence: SequenceDict,
+    speed_up_factor: float,
+    slow_down_factor: float,
+) -> None:
+    user_key = str(metadata["user"])
+
+    rows_by_augmentation["original"][user_key].append(sequence_to_row(base_sequence, metadata))
+
+    flipped_sequence = flip_sequence(base_sequence)
+    rows_by_augmentation["flipped"][user_key].append(sequence_to_row(flipped_sequence, metadata))
+
+    speed_up_sequence = resample_sequence(base_sequence, speed_up_factor)
+    rows_by_augmentation["speed_up"][user_key].append(sequence_to_row(speed_up_sequence, metadata))
+
+    slow_down_sequence = resample_sequence(base_sequence, slow_down_factor)
+    rows_by_augmentation["slow_down"][user_key].append(sequence_to_row(slow_down_sequence, metadata))
+
+
+def _finalize_rows(rows_by_augmentation: RowsByAugmentation) -> Dict[str, Dict[str, List[RowDict]]]:
+    return {
+        augmentation: {user: list(rows) for user, rows in user_rows.items()}
+        for augmentation, user_rows in rows_by_augmentation.items()
+    }
+
+
+def _merge_rows(
+    destination: RowsByAugmentation,
+    addition: Mapping[str, Mapping[str, List[RowDict]]],
+) -> None:
+    for augmentation, user_rows in addition.items():
+        destination_user_rows = destination[augmentation]
+        for user, rows in user_rows.items():
+            destination_user_rows[user].extend(rows)
+
+
+def _chunk_video_paths(video_paths: Sequence[Path], workers: int) -> List[List[Path]]:
+    if workers <= 1 or not video_paths:
+        return [list(video_paths)]
+
+    max_chunks = min(len(video_paths), workers)
+    array = np.array(video_paths, dtype=object)
+    return [list(chunk) for chunk in np.array_split(array, max_chunks) if len(chunk)]
+
+
+def _chunk_user_groups(
+    user_video_map: Mapping[str, Sequence[Path]],
+    workers: int,
+) -> List[List[Path]]:
+    if workers <= 1 or not user_video_map:
+        flat = list(chain.from_iterable(user_video_map.values()))
+        return [flat] if flat else []
+
+    users = sorted(user_video_map.keys())
+    max_chunks = min(len(users), workers)
+    user_array = np.array(users, dtype=object)
+    chunks: List[List[Path]] = []
+    for user_chunk in np.array_split(user_array, max_chunks):
+        paths: List[Path] = []
+        for user in user_chunk:
+            paths.extend(user_video_map[str(user)])
+        if paths:
+            chunks.append(paths)
+    return chunks
+
+
+def _process_video_batch(
+    video_paths: Sequence[str],
+    dataset_root: str,
+    min_visibility: float,
+    speed_up_factor: float,
+    slow_down_factor: float,
+    holistic_kwargs: Mapping[str, float | bool],
+    worker_id: int | None = None,
+    progress_queue: Any | None = None,
+) -> Dict[str, Dict[str, List[RowDict]]]:
+    rows = _initialize_rows_container()
+    dataset_root_path = Path(dataset_root)
+    with mp_holistic.Holistic(**holistic_kwargs) as holistic:
+        for video_path_str in video_paths:
+            video_path = Path(video_path_str)
+            metadata = _metadata_from_path(dataset_root_path, video_path)
+            start_time = time.perf_counter()
+            base_sequence = extract_video_landmarks(video_path, holistic, min_visibility)
+            metadata = dict(metadata)
+            metadata["extraction_time_sec"] = round(time.perf_counter() - start_time, 6)
+            _append_rows_for_sequences(
+                rows,
+                metadata,
+                base_sequence,
+                speed_up_factor,
+                slow_down_factor,
+            )
+            if progress_queue is not None and worker_id is not None:
+                progress_queue.put(worker_id)
+    return _finalize_rows(rows)
+
+
 def write_augmented_csvs(
-    rows_by_augmentation: Mapping[str, Mapping[str, List[Dict[str, str | int]]]],
+    rows_by_augmentation: Mapping[str, Mapping[str, List[RowDict]]],
     output_dirs: Mapping[str, Path],
 ) -> None:
     ordered_columns: List[str] = list(METADATA_COLUMNS)
@@ -446,12 +585,8 @@ def run_extraction(config: ExtractionConfig) -> None:
 
     output_dirs = ensure_output_directories(config.output_root)
 
-    rows_by_augmentation: Dict[str, MutableMapping[str, List[Dict[str, str | int]]]] = {
-        "original": defaultdict(list),
-        "flipped": defaultdict(list),
-        "speed_up": defaultdict(list),
-        "slow_down": defaultdict(list),
-    }
+    rows_by_augmentation = _initialize_rows_container()
+    user_video_map = group_videos_by_user(dataset_root, video_paths)
 
     holistic_kwargs = {
         "static_image_mode": False,
@@ -462,31 +597,85 @@ def run_extraction(config: ExtractionConfig) -> None:
         "min_tracking_confidence": config.min_tracking_confidence,
     }
 
-    with mp_holistic.Holistic(**holistic_kwargs) as holistic:
-        for video_path in tqdm(video_paths, desc="Extracting landmarks"):
-            metadata = _metadata_from_path(dataset_root, video_path)
+    if config.workers <= 1:
+        with mp_holistic.Holistic(**holistic_kwargs) as holistic:
+            for video_path in tqdm(video_paths, desc="Extracting landmarks"):
+                metadata = _metadata_from_path(dataset_root, video_path)
 
-            base_sequence = extract_video_landmarks(video_path, holistic, config.min_visibility)
+                start_time = time.perf_counter()
+                base_sequence = extract_video_landmarks(video_path, holistic, config.min_visibility)
+                metadata["extraction_time_sec"] = round(time.perf_counter() - start_time, 6)
 
-            original_row = sequence_to_row(base_sequence, metadata)
-            rows_by_augmentation["original"][metadata["user"]].append(original_row)
+                _append_rows_for_sequences(
+                    rows_by_augmentation,
+                    metadata,
+                    base_sequence,
+                    config.speed_up_factor,
+                    config.slow_down_factor,
+                )
+    else:
+        chunks = _chunk_user_groups(user_video_map, config.workers)
+        with Manager() as manager:
+            progress_queue = manager.Queue()
+            worker_bars: Dict[int, tqdm] = {}
+            future_to_worker: Dict[Any, int] = {}
+            with tqdm(total=len(video_paths), desc="Total", position=0, leave=True) as total_bar:
+                with ProcessPoolExecutor(max_workers=config.workers) as executor:
+                    for index, chunk in enumerate(chunks):
+                        if not chunk:
+                            continue
+                        chunk_paths = [str(path) for path in chunk]
+                        worker_id = index
+                        worker_bars[worker_id] = tqdm(
+                            total=len(chunk_paths),
+                            desc=f"Worker {index + 1}",
+                            position=index + 1,
+                            leave=False,
+                        )
+                        future = executor.submit(
+                            _process_video_batch,
+                            chunk_paths,
+                            str(dataset_root),
+                            config.min_visibility,
+                            config.speed_up_factor,
+                            config.slow_down_factor,
+                            holistic_kwargs,
+                            worker_id,
+                            progress_queue,
+                        )
+                        future_to_worker[future] = worker_id
 
-            flipped_sequence = flip_sequence(base_sequence)
-            rows_by_augmentation["flipped"][metadata["user"]].append(
-                sequence_to_row(flipped_sequence, metadata)
-            )
+                    pending = set(future_to_worker)
+                    while pending:
+                        try:
+                            worker_id = progress_queue.get(timeout=0.1)
+                        except Empty:
+                            pass
+                        else:
+                            if worker_id in worker_bars:
+                                worker_bars[worker_id].update(1)
+                            total_bar.update(1)
 
-            speed_up_sequence = resample_sequence(base_sequence, config.speed_up_factor)
-            rows_by_augmentation["speed_up"][metadata["user"]].append(
-                sequence_to_row(speed_up_sequence, metadata)
-            )
+                        finished = [future for future in pending if future.done()]
+                        for future in finished:
+                            chunk_rows = future.result()
+                            _merge_rows(rows_by_augmentation, chunk_rows)
+                            pending.remove(future)
 
-            slow_down_sequence = resample_sequence(base_sequence, config.slow_down_factor)
-            rows_by_augmentation["slow_down"][metadata["user"]].append(
-                sequence_to_row(slow_down_sequence, metadata)
-            )
+                    while True:
+                        try:
+                            worker_id = progress_queue.get_nowait()
+                        except Empty:
+                            break
+                        else:
+                            if worker_id in worker_bars:
+                                worker_bars[worker_id].update(1)
+                            total_bar.update(1)
 
-    write_augmented_csvs(rows_by_augmentation, output_dirs)
+            for bar in worker_bars.values():
+                bar.close()
+
+    write_augmented_csvs(_finalize_rows(rows_by_augmentation), output_dirs)
 
 
 def parse_arguments() -> ExtractionConfig:
@@ -518,7 +707,7 @@ def parse_arguments() -> ExtractionConfig:
     parser.add_argument(
         "--min-visibility",
         type=float,
-        default=0.5,
+        default=0.2,
         help="Minimum landmark visibility required to keep a pose landmark (default: 0.5).",
     )
     parser.add_argument(
@@ -532,6 +721,12 @@ def parse_arguments() -> ExtractionConfig:
         type=float,
         default=0.5,
         help="Temporal resampling factor for the slow-down augmentation (default: 0.5).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel worker processes to use for extraction (default: 1).",
     )
 
     args = parser.parse_args()
@@ -547,6 +742,7 @@ def parse_arguments() -> ExtractionConfig:
         min_visibility=args.min_visibility,
         speed_up_factor=args.speed_up_factor,
         slow_down_factor=args.slow_down_factor,
+        workers=max(1, args.workers),
     )
 
 
@@ -558,4 +754,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

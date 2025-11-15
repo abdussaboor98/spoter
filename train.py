@@ -8,6 +8,7 @@ import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+from tqdm.auto import tqdm
 
 from utils import stratified_train_validation_split, select_training_subset
 from datasets.czech_slr_dataset import CzechSignLanguageDataset
@@ -21,7 +22,7 @@ def build_training_arg_parser():
 
     parser.add_argument("--experiment_name", type=str, default="lsa_64_spoter",
                         help="Name of the experiment after which the logs and plots will be named")
-    parser.add_argument("--num_classes", type=int, default=64, help="Number of classes to be recognized by the model")
+    parser.add_argument("--num_classes", type=int, default=10, help="Number of classes to be recognized by the model")
     parser.add_argument("--hidden_dim", type=int, default=108,
                         help="Hidden dimension of the underlying Transformer model")
     parser.add_argument("--seed", type=int, default=379,
@@ -35,7 +36,7 @@ def build_training_arg_parser():
                              "gradually enlarging training set experiment from the paper)")
 
     parser.add_argument("--validation_set", type=str, choices=["from-file", "split-from-train", "none"],
-                        default="from-file", help="Type of validation set construction. See README for further reference")
+                        default="none", help="Type of validation set construction. See README for further reference")
     parser.add_argument("--validation_set_size", type=float,
                         help="Proportion of the training set to be split as validation set, if 'validation_size' is set"
                              " to 'split-from-train'")
@@ -164,14 +165,33 @@ def run_training(args):
         print("Starting " + args.experiment_name + "...\n\n")
         logging.info("Starting " + args.experiment_name + "...\n\n")
 
-    for epoch in range(args.epochs):
-        epoch_loss, _, _, training_accuracy = train_single_epoch(spoter_model, training_dataset, loss_function, optimizer, scheduler)
+    epoch_bar = tqdm(range(args.epochs), desc="Epochs", unit="epoch")
+    for epoch in epoch_bar:
+        epoch_loss, _, _, training_accuracy = train_single_epoch(
+            spoter_model,
+            training_dataset,
+            loss_function,
+            optimizer,
+            scheduler,
+            show_sample_progress=True,
+            epoch_description=f"Epoch {epoch + 1}/{args.epochs}",
+        )
         epoch_losses.append(epoch_loss / len(training_dataset))
         training_accuracies.append(training_accuracy)
 
         if validation_dataset:
             validation_correct, validation_total, validation_accuracy = evaluate_model(spoter_model, validation_dataset)
             validation_accuracies.append(validation_accuracy)
+
+        metrics_postfix = {
+            "loss": f"{epoch_losses[-1]:.4f}",
+            "train_acc": f"{training_accuracy:.4f}",
+        }
+
+        if validation_dataset:
+            metrics_postfix["val_acc"] = f"{validation_accuracy:.4f}"
+
+        epoch_bar.set_postfix(metrics_postfix)
 
         if args.save_checkpoints:
             if training_accuracy > best_training_accuracy:
@@ -185,14 +205,14 @@ def run_training(args):
                 spoter_model.save_weights(checkpoint_path)
 
         if epoch % args.log_freq == 0:
-            print("[" + str(epoch + 1) + "] TRAIN  loss: " + str(epoch_losses[-1]) + " acc: " + str(training_accuracy))
+            tqdm.write("[" + str(epoch + 1) + "] TRAIN  loss: " + str(epoch_losses[-1]) + " acc: " + str(training_accuracy))
             logging.info("[" + str(epoch + 1) + "] TRAIN  loss: " + str(epoch_losses[-1]) + " acc: " + str(training_accuracy))
 
             if validation_dataset:
-                print("[" + str(epoch + 1) + "] VALIDATION  acc: " + str(validation_accuracy))
+                tqdm.write("[" + str(epoch + 1) + "] VALIDATION  acc: " + str(validation_accuracy))
                 logging.info("[" + str(epoch + 1) + "] VALIDATION  acc: " + str(validation_accuracy))
 
-            print("")
+            tqdm.write("")
             logging.info("")
 
         if epoch % 10 == 0:

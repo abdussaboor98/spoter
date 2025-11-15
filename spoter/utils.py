@@ -5,6 +5,7 @@ from typing import Optional
 
 import numpy as np
 import tensorflow as tf
+from tqdm.auto import tqdm
 
 
 class PlateauLearningRateScheduler:
@@ -46,13 +47,26 @@ def _ensure_label_batch(labels: tf.Tensor) -> tf.Tensor:
 
 
 def train_single_epoch(model: tf.keras.Model, dataset, loss_fn, optimizer,
-                       scheduler: Optional[PlateauLearningRateScheduler] = None):
+                       scheduler: Optional[PlateauLearningRateScheduler] = None,
+                       show_sample_progress: bool = False, epoch_description: Optional[str] = None):
     correct_predictions, total_predictions = 0, 0
     cumulative_loss = 0.0
 
     sample_indices = np.random.permutation(len(dataset))
+    progress_iterator = sample_indices
+    sample_bar = None
+    processed_samples = 0
 
-    for sample_index in sample_indices:
+    if show_sample_progress:
+        sample_bar = tqdm(
+            sample_indices,
+            desc=epoch_description or "Training samples",
+            leave=False,
+            unit="sample",
+        )
+        progress_iterator = sample_bar
+
+    for sample_index in progress_iterator:
         features, labels = dataset[sample_index]
         batched_inputs = _ensure_batch_dimension(features)
         batched_labels = _ensure_label_batch(labels)
@@ -71,8 +85,21 @@ def train_single_epoch(model: tf.keras.Model, dataset, loss_fn, optimizer,
         correct_predictions += int(tf.reduce_sum(tf.cast(tf.equal(predictions, batched_labels), tf.int32)))
         total_predictions += int(batched_labels.shape[0])
 
+        processed_samples += 1
+
+        if sample_bar is not None:
+            running_loss = cumulative_loss / processed_samples
+            running_accuracy = (correct_predictions / total_predictions) if total_predictions else 0.0
+            sample_bar.set_postfix({
+                "loss": f"{running_loss:.4f}",
+                "acc": f"{running_accuracy:.4f}",
+            })
+
     if scheduler:
         scheduler.step(cumulative_loss / len(dataset))
+
+    if sample_bar is not None:
+        sample_bar.close()
 
     accuracy = (correct_predictions / total_predictions) if total_predictions else 0.0
     return cumulative_loss, correct_predictions, total_predictions, accuracy
