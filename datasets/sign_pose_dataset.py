@@ -1,4 +1,5 @@
 import ast
+from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple
 
 import numpy as np
@@ -6,19 +7,27 @@ import pandas as pd
 import tensorflow as tf
 
 from normalization.body_normalization import BODY_IDENTIFIERS
-from normalization.hand_normalization import HAND_IDENTIFIERS
-from normalization.body_normalization import normalize_single_dict as normalize_single_body_dict
-from normalization.hand_normalization import normalize_single_dict as normalize_single_hand_dict
+from normalization.hand_normalization import HAND_IDENTIFIERS as BASE_HAND_IDENTIFIERS
 
-HAND_IDENTIFIERS = [identifier + "_0" for identifier in HAND_IDENTIFIERS] + [identifier + "_1" for identifier in HAND_IDENTIFIERS]
+LEFT_HAND_IDENTIFIERS = [identifier + "_0" for identifier in BASE_HAND_IDENTIFIERS]
+RIGHT_HAND_IDENTIFIERS = [identifier + "_1" for identifier in BASE_HAND_IDENTIFIERS]
+HAND_IDENTIFIERS = LEFT_HAND_IDENTIFIERS + RIGHT_HAND_IDENTIFIERS
 ALL_IDENTIFIERS = BODY_IDENTIFIERS + HAND_IDENTIFIERS
 IDENTIFIER_TO_INDEX = {identifier: index for index, identifier in enumerate(ALL_IDENTIFIERS)}
 
 LEFT_ARM_IDENTIFIERS = ["leftShoulder", "leftElbow", "leftWrist"]
 RIGHT_ARM_IDENTIFIERS = ["rightShoulder", "rightElbow", "rightWrist"]
 
+BODY_ANCHOR_IDENTIFIERS = {
+    "neck": "neck",
+    "nose": "nose",
+    "left_shoulder": "leftShoulder",
+    "right_shoulder": "rightShoulder",
+    "left_eye": "leftEye",
+}
 
-def load_pose_sequences(file_location: str) -> Tuple[Sequence[np.ndarray], Sequence[int]]:
+
+def _load_raw_pose_sequences(file_location: str) -> Tuple[Sequence[np.ndarray], Sequence[int]]:
     dataframe = pd.read_csv(file_location, encoding="utf-8")
     dataframe.columns = [item.replace("_left_", "_0_").replace("_right_", "_1_") for item in list(dataframe.columns)]
 
@@ -43,29 +52,33 @@ def load_pose_sequences(file_location: str) -> Tuple[Sequence[np.ndarray], Seque
     return pose_sequences, labels
 
 
-def pose_tensor_to_dict(landmarks_array: np.ndarray) -> dict:
-    data_array = np.asarray(landmarks_array)
-    landmark_dictionary = {}
-
-    for landmark_index, identifier in enumerate(ALL_IDENTIFIERS):
-        landmark_dictionary[identifier] = [
-            (float(frame[0]), float(frame[1])) for frame in data_array[:, landmark_index]
-        ]
-
-    return landmark_dictionary
+def _cache_file_path(csv_path: str) -> Path:
+    csv_path_obj = Path(csv_path)
+    return csv_path_obj.with_suffix(csv_path_obj.suffix + ".npz")
 
 
-def pose_dict_to_tensor(landmarks_dict: dict) -> tf.Tensor:
-    sequence_length = len(landmarks_dict["leftEar"])
-    pose_tensor = np.empty(
-        shape=(sequence_length, len(ALL_IDENTIFIERS), 2), dtype=np.float32
+def load_or_cache_sequences(file_location: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    cache_path = _cache_file_path(file_location)
+    if cache_path.exists():
+        cached = np.load(cache_path, allow_pickle=False)
+        return cached["poses"], cached["lengths"], cached["labels"]
+
+    pose_sequences, labels = _load_raw_pose_sequences(file_location)
+    lengths = np.array([sequence.shape[0] for sequence in pose_sequences], dtype=np.int32)
+    max_length = int(np.max(lengths))
+    joint_count = pose_sequences[0].shape[1]
+    padded_sequences = np.zeros((len(pose_sequences), max_length, joint_count, 2), dtype=np.float32)
+    for index, sequence in enumerate(pose_sequences):
+        length = sequence.shape[0]
+        padded_sequences[index, :length] = sequence
+
+    np.savez(
+        cache_path,
+        poses=padded_sequences,
+        lengths=lengths,
+        labels=np.asarray(labels, dtype=np.int32),
     )
-
-    for landmark_index, identifier in enumerate(ALL_IDENTIFIERS):
-        pose_tensor[:, landmark_index, 0] = [frame[0] for frame in landmarks_dict[identifier]]
-        pose_tensor[:, landmark_index, 1] = [frame[1] for frame in landmarks_dict[identifier]]
-
-    return tf.convert_to_tensor(pose_tensor, dtype=tf.float32)
+    return padded_sequences, lengths, np.asarray(labels, dtype=np.int32)
 
 
 class SignPoseDataset:
@@ -85,47 +98,44 @@ class SignPoseDataset:
             self.sequence_lengths = np.array(lengths, dtype=np.int32)
             self.labels = np.array(labels, dtype=np.int32)
         elif dataset_filename is not None:
-            loaded_data = load_pose_sequences(dataset_filename)
-            pose_sequences, labels = list(loaded_data[0]), list(loaded_data[1])
-            self.sequence_lengths = np.array([sequence.shape[0] for sequence in pose_sequences], dtype=np.int32)
-            self.max_sequence_length = int(np.max(self.sequence_lengths))
-            joint_count = pose_sequences[0].shape[1]
-            self.pose_sequences = np.zeros(
-                (len(pose_sequences), self.max_sequence_length, joint_count, 2),
-                dtype=np.float32,
-            )
-            for index, sequence in enumerate(pose_sequences):
-                length = sequence.shape[0]
-                self.pose_sequences[index, :length] = sequence
-            self.labels = np.asarray(labels, dtype=np.int32) - 1
+            cached_data = load_or_cache_sequences(dataset_filename)
+            self.pose_sequences, self.sequence_lengths, raw_labels = cached_data
+            self.labels = np.asarray(raw_labels, dtype=np.int32) - 1
         else:
             raise ValueError("Either dataset_filename or data/lengths/labels must be provided.")
 
-        if data is not None:
-            self.max_sequence_length = self.pose_sequences.shape[1]
+        self.max_sequence_length = self.pose_sequences.shape[1]
 
         self.num_samples = self.pose_sequences.shape[0]
         self.num_joints = self.pose_sequences.shape[2]
         self.input_shape = (self.max_sequence_length, self.num_joints, 2)
         self.targets = self.labels.tolist()
         self.augmentations_prob = float(augmentations_prob)
-
-        if dataset_filename is not None and normalize:
-            self._normalize_sequences()
-
-        if dataset_filename is not None:
-            self.pose_sequences = self.pose_sequences - 0.5
-
-    def _normalize_sequences(self):
-        normalized_sequences = np.zeros_like(self.pose_sequences)
-        for index in range(self.num_samples):
-            length = self.sequence_lengths[index]
-            pose_dict = pose_tensor_to_dict(self.pose_sequences[index, :length])
-            pose_dict = normalize_single_body_dict(pose_dict)
-            pose_dict = normalize_single_hand_dict(pose_dict)
-            normalized_tensor = pose_dict_to_tensor(pose_dict).numpy()
-            normalized_sequences[index, :length] = normalized_tensor
-        self.pose_sequences = normalized_sequences
+        self.normalize = normalize
+        self.body_joint_mask = tf.constant(
+            [identifier in BODY_IDENTIFIERS for identifier in ALL_IDENTIFIERS],
+            dtype=tf.bool,
+        )
+        self.left_hand_indices = tf.constant(
+            [IDENTIFIER_TO_INDEX[identifier] for identifier in LEFT_HAND_IDENTIFIERS],
+            dtype=tf.int32,
+        )
+        self.right_hand_indices = tf.constant(
+            [IDENTIFIER_TO_INDEX[identifier] for identifier in RIGHT_HAND_IDENTIFIERS],
+            dtype=tf.int32,
+        )
+        self.left_arm_indices = tf.constant(
+            [IDENTIFIER_TO_INDEX[identifier] for identifier in LEFT_ARM_IDENTIFIERS],
+            dtype=tf.int32,
+        )
+        self.right_arm_indices = tf.constant(
+            [IDENTIFIER_TO_INDEX[identifier] for identifier in RIGHT_ARM_IDENTIFIERS],
+            dtype=tf.int32,
+        )
+        self.body_anchor_indices = {
+            key: IDENTIFIER_TO_INDEX[value]
+            for key, value in BODY_ANCHOR_IDENTIFIERS.items()
+        }
 
     def __len__(self):
         return self.num_samples
@@ -146,7 +156,7 @@ class SignPoseDataset:
             lengths=subset_lengths,
             labels=subset_labels,
             augmentations_prob=self.augmentations_prob,
-            normalize=False,
+            normalize=self.normalize,
         )
 
     def as_tf_dataset(
@@ -167,8 +177,12 @@ class SignPoseDataset:
         def _map_sample(pose, length, label):
             pose = tf.ensure_shape(pose, self.input_shape)
             mask = tf.sequence_mask(length, maxlen=self.max_sequence_length)
+            pose = self._apply_mask(pose, mask)
             if augment:
                 pose = self._maybe_augment(pose, mask)
+            if self.normalize:
+                pose = self._normalize_pose(pose, mask)
+            pose = pose - 0.5
             if gaussian_noise is not None:
                 pose = gaussian_noise(pose)
             return {"pose": pose, "mask": mask}, label
@@ -238,9 +252,11 @@ class SignPoseDataset:
 
     def _rotate_random_arm(self, pose: tf.Tensor, mask: tf.Tensor) -> tf.Tensor:
         arm_choice = tf.random.uniform([], minval=0, maxval=2, dtype=tf.int32)
-        left_arm_indices = tf.constant([IDENTIFIER_TO_INDEX[name] for name in LEFT_ARM_IDENTIFIERS], dtype=tf.int32)
-        right_arm_indices = tf.constant([IDENTIFIER_TO_INDEX[name] for name in RIGHT_ARM_IDENTIFIERS], dtype=tf.int32)
-        joint_indices = tf.cond(arm_choice == 0, lambda: left_arm_indices, lambda: right_arm_indices)
+        joint_indices = tf.cond(
+            arm_choice == 0,
+            lambda: self.left_arm_indices,
+            lambda: self.right_arm_indices,
+        )
         return self._rotate_arm_segment(pose, joint_indices)
 
     def _rotate_arm_segment(self, pose: tf.Tensor, joint_indices: tf.Tensor) -> tf.Tensor:
@@ -271,6 +287,171 @@ class SignPoseDataset:
         )
         updates = tf.reshape(updated_values, (-1, 2))
         return tf.tensor_scatter_nd_update(pose, scatter_indices, updates)
+
+    def _normalize_pose(self, pose: tf.Tensor, mask: tf.Tensor) -> tf.Tensor:
+        normalized_pose = self._normalize_body_joints(pose, mask)
+        normalized_pose = self._normalize_hands(normalized_pose, mask, self.left_hand_indices)
+        normalized_pose = self._normalize_hands(normalized_pose, mask, self.right_hand_indices)
+        return normalized_pose
+
+    def _normalize_body_joints(self, pose: tf.Tensor, mask: tf.Tensor) -> tf.Tensor:
+        pose_dtype = pose.dtype
+        mask = tf.cast(mask, tf.bool)
+
+        indices = self.body_anchor_indices
+        left_shoulder = pose[:, indices["left_shoulder"], :]
+        right_shoulder = pose[:, indices["right_shoulder"], :]
+        neck = pose[:, indices["neck"], :]
+        nose = pose[:, indices["nose"], :]
+        left_eye = pose[:, indices["left_eye"], :]
+
+        left_shoulder_valid = self._joint_valid_mask(left_shoulder)
+        right_shoulder_valid = self._joint_valid_mask(right_shoulder)
+        neck_valid = self._joint_valid_mask(neck)
+        nose_valid = self._joint_valid_mask(nose)
+        left_eye_valid = self._joint_valid_mask(left_eye)
+
+        shoulder_valid = left_shoulder_valid & right_shoulder_valid
+        head_vector = tf.linalg.norm(left_shoulder - right_shoulder, axis=-1)
+        fallback_vector = tf.linalg.norm(neck - nose, axis=-1)
+        head_metric = tf.where(shoulder_valid, head_vector, fallback_vector)
+        head_metric_valid = tf.where(shoulder_valid, shoulder_valid, neck_valid & nose_valid)
+        head_metric_valid = head_metric_valid & mask
+        head_metric = tf.where(head_metric_valid, head_metric, tf.zeros_like(head_metric))
+
+        neck_x = neck[:, 0]
+        neck_x_valid = neck_valid & mask
+        eye_y = tf.where(left_eye_valid, left_eye[:, 1], tf.where(neck_valid, neck[:, 1], tf.zeros_like(neck[:, 1])))
+        eye_valid = (left_eye_valid | neck_valid) & mask
+
+        start_x = neck_x - (3.0 * head_metric)
+        start_y = eye_y + (0.5 * head_metric)
+        end_x = neck_x + (3.0 * head_metric)
+        end_y = start_y - (6.0 * head_metric)
+
+        box_valid = head_metric_valid & neck_x_valid & eye_valid
+        start_x = self._forward_fill(start_x, box_valid)
+        start_y = self._forward_fill(start_y, box_valid)
+        end_x = self._forward_fill(end_x, box_valid)
+        end_y = self._forward_fill(end_y, box_valid)
+
+        width = tf.maximum(end_x - start_x, tf.constant(1e-6, dtype=pose_dtype))
+        height = tf.maximum(start_y - end_y, tf.constant(1e-6, dtype=pose_dtype))
+
+        normalized_x = (pose[:, :, 0] - start_x[:, tf.newaxis]) / width[:, tf.newaxis]
+        normalized_y = (pose[:, :, 1] - end_y[:, tf.newaxis]) / height[:, tf.newaxis]
+        normalized = tf.stack([normalized_x, normalized_y], axis=-1)
+
+        joint_presence = self._joint_presence_mask(pose)
+        frame_mask = mask[:, tf.newaxis]
+        body_mask = self.body_joint_mask[tf.newaxis, :]
+        update_mask_bool = body_mask & joint_presence & frame_mask
+        update_mask = tf.broadcast_to(
+            tf.cast(update_mask_bool[..., tf.newaxis], pose_dtype),
+            tf.shape(pose),
+        )
+        normalized_pose = pose * (1.0 - update_mask) + normalized * update_mask
+        return normalized_pose
+
+    def _normalize_hands(self, pose: tf.Tensor, mask: tf.Tensor, joint_indices: tf.Tensor) -> tf.Tensor:
+        pose_dtype = pose.dtype
+        mask = tf.cast(mask, tf.bool)
+        hand_coords = tf.gather(pose, joint_indices, axis=1)
+        hand_presence = self._joint_presence_mask(hand_coords)
+        valid_frames = mask[:, tf.newaxis] & hand_presence
+        if_valid = tf.reduce_any(valid_frames)
+        def no_op():
+            return pose
+
+        def normalize_frames():
+            large_value = tf.constant(1e6, dtype=pose_dtype)
+            small_value = tf.constant(-1e6, dtype=pose_dtype)
+            coords_for_min = tf.where(
+                valid_frames[..., tf.newaxis],
+                hand_coords,
+                tf.ones_like(hand_coords) * large_value,
+            )
+            coords_for_max = tf.where(
+                valid_frames[..., tf.newaxis],
+                hand_coords,
+                tf.ones_like(hand_coords) * small_value,
+            )
+            min_vals = tf.reduce_min(coords_for_min, axis=1)
+            max_vals = tf.reduce_max(coords_for_max, axis=1)
+
+            width = max_vals[:, 0] - min_vals[:, 0]
+            height = max_vals[:, 1] - min_vals[:, 1]
+            width = tf.maximum(width, tf.constant(1e-6, dtype=pose_dtype))
+            height = tf.maximum(height, tf.constant(1e-6, dtype=pose_dtype))
+            width_greater = width > height
+
+            delta_x_width = 0.1 * width
+            delta_y_width = delta_x_width + 0.5 * (width - height)
+            delta_y_height = 0.1 * height
+            delta_x_height = delta_y_height + 0.5 * (height - width)
+
+            delta_x = tf.where(width_greater, delta_x_width, delta_x_height)
+            delta_y = tf.where(width_greater, delta_y_width, delta_y_height)
+
+            start_x = min_vals[:, 0] - delta_x
+            start_y = min_vals[:, 1] - delta_y
+            end_x = max_vals[:, 0] + delta_x
+            end_y = max_vals[:, 1] + delta_y
+
+            width_box = tf.maximum(end_x - start_x, tf.constant(1e-6, dtype=pose_dtype))
+            height_box = tf.maximum(start_y - end_y, tf.constant(1e-6, dtype=pose_dtype))
+
+            norm_x = (hand_coords[:, :, 0] - start_x[:, tf.newaxis]) / width_box[:, tf.newaxis]
+            norm_y = (hand_coords[:, :, 1] - end_y[:, tf.newaxis]) / height_box[:, tf.newaxis]
+            normalized_hand = tf.stack([norm_x, norm_y], axis=-1)
+            valid_mask = valid_frames[..., tf.newaxis]
+            normalized_hand = tf.where(valid_mask, normalized_hand, hand_coords)
+
+            seq_len = tf.shape(pose)[0]
+            joint_count = tf.shape(joint_indices)[0]
+            frame_ids = tf.tile(tf.range(seq_len)[:, tf.newaxis], [1, joint_count])
+            joint_ids = tf.tile(joint_indices[tf.newaxis, :], [seq_len, 1])
+            scatter_indices = tf.stack(
+                [tf.reshape(frame_ids, [-1]), tf.reshape(joint_ids, [-1])],
+                axis=1,
+            )
+            updates = tf.reshape(normalized_hand, (-1, 2))
+            return tf.tensor_scatter_nd_update(pose, scatter_indices, updates)
+
+        return tf.cond(if_valid, normalize_frames, no_op)
+
+    @staticmethod
+    def _joint_valid_mask(joint_coordinates: tf.Tensor) -> tf.Tensor:
+        return tf.reduce_any(tf.not_equal(joint_coordinates, 0.0), axis=-1)
+
+    @staticmethod
+    def _joint_presence_mask(pose: tf.Tensor) -> tf.Tensor:
+        return tf.reduce_any(tf.not_equal(pose, 0.0), axis=-1)
+
+    @staticmethod
+    def _forward_fill(values: tf.Tensor, valid_mask: tf.Tensor) -> tf.Tensor:
+        dtype = values.dtype
+        valid_mask = tf.cast(valid_mask, tf.bool)
+        length = tf.shape(values)[0]
+        initial_value = tf.zeros_like(values[0])
+        output = tf.TensorArray(dtype, size=length)
+
+        def condition(i, *_):
+            return i < length
+
+        def body(i, last_value, ta):
+            current_value = values[i]
+            is_valid = valid_mask[i]
+            new_value = tf.where(is_valid, current_value, last_value)
+            ta = ta.write(i, new_value)
+            return i + 1, new_value, ta
+
+        _, _, output = tf.while_loop(
+            condition,
+            body,
+            loop_vars=(tf.constant(0), initial_value, output),
+        )
+        return output.stack()
 
 
 if __name__ == "__main__":
