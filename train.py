@@ -12,7 +12,7 @@ from tqdm.auto import tqdm
 
 from utils import stratified_train_validation_split, select_training_subset
 from datasets.czech_slr_dataset import CzechSignLanguageDataset
-from spoter.spoter_model import SPOTER, create_quantization_aware_spoter
+from spoter.spoter_model import SPOTER
 from spoter.utils import train_single_epoch, evaluate_model, PlateauLearningRateScheduler
 from spoter.gaussian_noise import AdditiveGaussianNoise
 
@@ -68,10 +68,6 @@ def build_training_arg_parser():
     parser.add_argument("--plot_lr", type=bool, default=True,
                         help="Determines whether the LR should be plotted at the end")
 
-    # Quantization aware training
-    parser.add_argument("--quantization_aware_training", action="store_true",
-                        help="Enable TensorFlow Lite quantization aware training for SPOTER")
-
     return parser
 
 
@@ -97,14 +93,6 @@ def _initialize_model(args: argparse.Namespace, sample_shape=None) -> SPOTER:
         num_classes=args.num_classes,
         hidden_dim=args.hidden_dim,
     )
-
-    if args.quantization_aware_training:
-        if sample_shape is None:
-            raise ValueError("Sample shape must be provided to initialise QAT model.")
-        return create_quantization_aware_spoter(
-            example_input_shape=sample_shape,
-            **model_kwargs,
-        )
 
     model = SPOTER(**model_kwargs)
     return model
@@ -148,9 +136,8 @@ def run_training(args):
     optimizer = tf.keras.optimizers.SGD(learning_rate=args.lr)
     scheduler = PlateauLearningRateScheduler(optimizer, factor=args.scheduler_factor, patience=args.scheduler_patience)
 
-    if not args.quantization_aware_training:
-        dummy_input = tf.zeros((1,) + sample_shape, dtype=tf.float32)
-        spoter_model(dummy_input, training=False)
+    dummy_input = tf.zeros((1,) + sample_shape, dtype=tf.float32)
+    spoter_model(dummy_input, training=False)
 
     training_accuracy, validation_accuracy = 0, 0
     epoch_losses, training_accuracies, validation_accuracies = [], [], []
