@@ -70,7 +70,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
-from itertools import chain
 from multiprocessing import Manager
 from queue import Empty
 
@@ -332,12 +331,10 @@ def _interpolate_pair(values: Sequence[Point], position: float) -> Point:
     lower_idx, lower_point = _find_valid(lower_index, -1)
     upper_idx, upper_point = _find_valid(upper_index, 1)
 
-    if lower_point is None and upper_point is None:
+    if (lower_point is None and upper_point is None) or lower_point is None:
         return 0.0, 0.0
-    if lower_point is None:
-        return upper_point  # type: ignore[return-value]
     if upper_point is None:
-        return lower_point
+        return 0.0, 0.0
 
     if lower_idx == upper_idx or lower_point == upper_point:
         return lower_point
@@ -410,6 +407,7 @@ class ExtractionConfig:
     speed_up_factor: float
     slow_down_factor: float
     workers: int
+    target_user: str | None = None
 
 
 def discover_videos(dataset_root: Path) -> List[Path]:
@@ -436,20 +434,6 @@ def _metadata_from_path(dataset_root: Path, video_path: Path) -> Dict[str, Metad
         "labels": label,
         "video_path": str(relative_path),
     }
-
-
-def group_videos_by_user(dataset_root: Path, video_paths: Sequence[Path]) -> Dict[str, List[Path]]:
-    grouped: Dict[str, List[Path]] = defaultdict(list)
-    for path in video_paths:
-        relative_path = path.relative_to(dataset_root)
-        try:
-            user_id = relative_path.parts[0]
-        except IndexError as exc:
-            raise ValueError(f"Unexpected directory layout for video '{path}'.") from exc
-        grouped[user_id].append(path)
-    return dict(grouped)
-
-
 def ensure_output_directories(output_root: Path) -> Mapping[str, Path]:
     subdirs = {
         "original": output_root / "original",
@@ -520,27 +504,6 @@ def _chunk_video_paths(video_paths: Sequence[Path], workers: int) -> List[List[P
     return [list(chunk) for chunk in np.array_split(array, max_chunks) if len(chunk)]
 
 
-def _chunk_user_groups(
-    user_video_map: Mapping[str, Sequence[Path]],
-    workers: int,
-) -> List[List[Path]]:
-    if workers <= 1 or not user_video_map:
-        flat = list(chain.from_iterable(user_video_map.values()))
-        return [flat] if flat else []
-
-    users = sorted(user_video_map.keys())
-    max_chunks = min(len(users), workers)
-    user_array = np.array(users, dtype=object)
-    chunks: List[List[Path]] = []
-    for user_chunk in np.array_split(user_array, max_chunks):
-        paths: List[Path] = []
-        for user in user_chunk:
-            paths.extend(user_video_map[str(user)])
-        if paths:
-            chunks.append(paths)
-    return chunks
-
-
 def _process_video_batch(
     video_paths: Sequence[str],
     dataset_root: str,
@@ -597,6 +560,19 @@ def run_extraction(config: ExtractionConfig) -> None:
     dataset_root = config.dataset_root
     video_paths = discover_videos(dataset_root)
 
+    if config.target_user:
+        filtered_paths = []
+        for path in video_paths:
+            try:
+                user_id = path.relative_to(dataset_root).parts[0]
+            except ValueError:
+                continue
+            if user_id == config.target_user:
+                filtered_paths.append(path)
+        if not filtered_paths:
+            logging.warning("No videos found for user '%s'.", config.target_user)
+        video_paths = filtered_paths
+
     if not video_paths:
         logging.warning("No videos found under %s", dataset_root)
         return
@@ -604,7 +580,6 @@ def run_extraction(config: ExtractionConfig) -> None:
     output_dirs = ensure_output_directories(config.output_root)
 
     rows_by_augmentation = _initialize_rows_container()
-    user_video_map = group_videos_by_user(dataset_root, video_paths)
 
     holistic_kwargs = {
         "static_image_mode": False,
@@ -632,7 +607,7 @@ def run_extraction(config: ExtractionConfig) -> None:
                     config.slow_down_factor,
                 )
     else:
-        chunks = _chunk_user_groups(user_video_map, config.workers)
+        chunks = _chunk_video_paths(video_paths, config.workers)
         with Manager() as manager:
             progress_queue = manager.Queue()
             worker_bars: Dict[int, tqdm] = {}
@@ -746,6 +721,12 @@ def parse_arguments() -> ExtractionConfig:
         default=1,
         help="Number of parallel worker processes to use for extraction (default: 1).",
     )
+    parser.add_argument(
+        "--user",
+        type=str,
+        default=None,
+        help="If provided, extract landmarks only for the specified user directory name.",
+    )
 
     args = parser.parse_args()
 
@@ -761,6 +742,7 @@ def parse_arguments() -> ExtractionConfig:
         speed_up_factor=args.speed_up_factor,
         slow_down_factor=args.slow_down_factor,
         workers=max(1, args.workers),
+        target_user=args.user,
     )
 
 
