@@ -19,7 +19,7 @@ The expected input directory structure is the following::
         ...
 
 Where ``userXX`` denotes the signer, ``GYY`` the gesture identifier and
-``RZZ.mp4`` the repetition index. For every video, this script produces four
+``RZZ.mp4`` the repetition index. For every video, this script produces two
 CSV rows:
 
 ``original``
@@ -27,10 +27,6 @@ CSV rows:
 ``flipped``
     Horizontally mirrored landmarks (left/right body parts swapped) to emulate
     both left- and right-handed signing.
-``speed_up``
-    Temporally down-sampled landmarks approximating a 1.5x speed-up.
-``slow_down``
-    Temporally up-sampled landmarks approximating a 0.5x slow-down.
 
 Each augmentation is written to a dedicated output sub-directory so that
 leave-one-user-out splits can exclude both the original and augmented data of
@@ -47,8 +43,6 @@ The resulting structure will resemble::
     /path/to/output_dir/
         original/user01.csv
         flipped/user01.csv
-        speed_up/user01.csv
-        slow_down/user01.csv
         original/user02.csv
         ...
 
@@ -312,72 +306,6 @@ def flip_sequence(sequence: SequenceDict) -> SequenceDict:
     return flipped
 
 
-def _interpolate_pair(values: Sequence[Point], position: float) -> Point:
-    if not values:
-        return 0.0, 0.0
-
-    lower_index = int(np.floor(position))
-    upper_index = min(lower_index + 1, len(values) - 1)
-
-    def _find_valid(start: int, direction: int) -> Tuple[int | None, Point | None]:
-        index = start
-        while 0 <= index < len(values):
-            point = values[index]
-            if point != (0.0, 0.0):
-                return index, point
-            index += direction
-        return None, None
-
-    lower_idx, lower_point = _find_valid(lower_index, -1)
-    upper_idx, upper_point = _find_valid(upper_index, 1)
-
-    if (lower_point is None and upper_point is None) or lower_point is None:
-        return 0.0, 0.0
-    if upper_point is None:
-        return 0.0, 0.0
-
-    if lower_idx == upper_idx or lower_point == upper_point:
-        return lower_point
-
-    distance = max(upper_idx - lower_idx, 1)
-    weight = np.clip((position - lower_idx) / distance, 0.0, 1.0)
-
-    x = (1 - weight) * lower_point[0] + weight * upper_point[0]
-    y = (1 - weight) * lower_point[1] + weight * upper_point[1]
-    return (float(x), float(y))
-
-
-def resample_sequence(sequence: SequenceDict, speed_factor: float) -> SequenceDict:
-    """Resample ``sequence`` to emulate a temporal speed change."""
-
-    if speed_factor <= 0:
-        raise ValueError("speed_factor must be greater than zero")
-
-    if not sequence:
-        return {}
-
-    any_key = next(iter(sequence))
-    original_length = len(sequence[any_key])
-
-    if original_length == 0:
-        return {key: [] for key in sequence}
-
-    if np.isclose(speed_factor, 1.0):
-        return {key: list(frames) for key, frames in sequence.items()}
-
-    target_length = max(1, int(round(original_length / speed_factor)))
-    # Ensure that the final frame is always included in the resampled sequence
-    positions = np.linspace(0, max(original_length - 1, 0), target_length)
-
-    resampled: SequenceDict = {key: [] for key in sequence}
-
-    for identifier, frames in sequence.items():
-        for position in positions:
-            resampled[identifier].append(_interpolate_pair(frames, float(position)))
-
-    return resampled
-
-
 def sequence_to_row(sequence: SequenceDict, metadata: Mapping[str, MetadataValue]) -> RowDict:
     row: RowDict = dict(metadata)
 
@@ -404,8 +332,6 @@ class ExtractionConfig:
     min_detection_confidence: float
     min_tracking_confidence: float
     min_visibility: float
-    speed_up_factor: float
-    slow_down_factor: float
     workers: int
     target_user: str | None = None
 
@@ -438,8 +364,6 @@ def ensure_output_directories(output_root: Path) -> Mapping[str, Path]:
     subdirs = {
         "original": output_root / "original",
         "flipped": output_root / "flipped",
-        "speed_up": output_root / "speed_up",
-        "slow_down": output_root / "slow_down",
     }
 
     for path in subdirs.values():
@@ -452,8 +376,6 @@ def _initialize_rows_container() -> RowsByAugmentation:
     return {
         "original": defaultdict(list),
         "flipped": defaultdict(list),
-        "speed_up": defaultdict(list),
-        "slow_down": defaultdict(list),
     }
 
 
@@ -461,8 +383,6 @@ def _append_rows_for_sequences(
     rows_by_augmentation: RowsByAugmentation,
     metadata: Mapping[str, MetadataValue],
     base_sequence: SequenceDict,
-    speed_up_factor: float,
-    slow_down_factor: float,
 ) -> None:
     user_key = str(metadata["user"])
 
@@ -470,12 +390,6 @@ def _append_rows_for_sequences(
 
     flipped_sequence = flip_sequence(base_sequence)
     rows_by_augmentation["flipped"][user_key].append(sequence_to_row(flipped_sequence, metadata))
-
-    speed_up_sequence = resample_sequence(base_sequence, speed_up_factor)
-    rows_by_augmentation["speed_up"][user_key].append(sequence_to_row(speed_up_sequence, metadata))
-
-    slow_down_sequence = resample_sequence(base_sequence, slow_down_factor)
-    rows_by_augmentation["slow_down"][user_key].append(sequence_to_row(slow_down_sequence, metadata))
 
 
 def _finalize_rows(rows_by_augmentation: RowsByAugmentation) -> Dict[str, Dict[str, List[RowDict]]]:
@@ -508,8 +422,6 @@ def _process_video_batch(
     video_paths: Sequence[str],
     dataset_root: str,
     min_visibility: float,
-    speed_up_factor: float,
-    slow_down_factor: float,
     holistic_kwargs: Mapping[str, float | bool],
     worker_id: int | None = None,
     progress_queue: Any | None = None,
@@ -528,8 +440,6 @@ def _process_video_batch(
                 rows,
                 metadata,
                 base_sequence,
-                speed_up_factor,
-                slow_down_factor,
             )
             if progress_queue is not None and worker_id is not None:
                 progress_queue.put(worker_id)
@@ -603,8 +513,6 @@ def run_extraction(config: ExtractionConfig) -> None:
                     rows_by_augmentation,
                     metadata,
                     base_sequence,
-                    config.speed_up_factor,
-                    config.slow_down_factor,
                 )
     else:
         chunks = _chunk_video_paths(video_paths, config.workers)
@@ -630,8 +538,6 @@ def run_extraction(config: ExtractionConfig) -> None:
                             chunk_paths,
                             str(dataset_root),
                             config.min_visibility,
-                            config.speed_up_factor,
-                            config.slow_down_factor,
                             holistic_kwargs,
                             worker_id,
                             progress_queue,
@@ -704,18 +610,6 @@ def parse_arguments() -> ExtractionConfig:
         help="Minimum landmark visibility required to keep a pose landmark (default: 0.5).",
     )
     parser.add_argument(
-        "--speed-up-factor",
-        type=float,
-        default=1.5,
-        help="Temporal resampling factor for the speed-up augmentation (default: 1.5).",
-    )
-    parser.add_argument(
-        "--slow-down-factor",
-        type=float,
-        default=0.5,
-        help="Temporal resampling factor for the slow-down augmentation (default: 0.5).",
-    )
-    parser.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -739,8 +633,6 @@ def parse_arguments() -> ExtractionConfig:
         min_detection_confidence=args.min_detection_confidence,
         min_tracking_confidence=args.min_tracking_confidence,
         min_visibility=args.min_visibility,
-        speed_up_factor=args.speed_up_factor,
-        slow_down_factor=args.slow_down_factor,
         workers=max(1, args.workers),
         target_user=args.user,
     )

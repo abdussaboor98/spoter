@@ -1,5 +1,5 @@
 import ast
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,71 @@ IDENTIFIER_TO_INDEX = {identifier: index for index, identifier in enumerate(ALL_
 
 LEFT_ARM_IDENTIFIERS = ["leftShoulder", "leftElbow", "leftWrist"]
 RIGHT_ARM_IDENTIFIERS = ["rightShoulder", "rightElbow", "rightWrist"]
+Point = Tuple[float, float]
+SequenceDict = Dict[str, List[Point]]
+
+
+def _interpolate_pair(values: Sequence[Point], position: float) -> Point:
+    if not values:
+        return 0.0, 0.0
+
+    lower_index = int(np.floor(position))
+    upper_index = min(lower_index + 1, len(values) - 1)
+
+    def _find_valid(start: int, direction: int) -> Tuple[Optional[int], Optional[Point]]:
+        index = start
+        while 0 <= index < len(values):
+            point = values[index]
+            if point != (0.0, 0.0):
+                return index, point
+            index += direction
+        return None, None
+
+    lower_idx, lower_point = _find_valid(lower_index, -1)
+    upper_idx, upper_point = _find_valid(upper_index, 1)
+
+    if (lower_point is None and upper_point is None) or lower_point is None:
+        return 0.0, 0.0
+    if upper_point is None:
+        return 0.0, 0.0
+
+    if lower_idx == upper_idx or lower_point == upper_point:
+        return lower_point
+
+    distance = max(upper_idx - lower_idx, 1)
+    weight = np.clip((position - lower_idx) / distance, 0.0, 1.0)
+
+    x = (1 - weight) * lower_point[0] + weight * upper_point[0]
+    y = (1 - weight) * lower_point[1] + weight * upper_point[1]
+    return float(x), float(y)
+
+
+def resample_sequence(sequence: SequenceDict, speed_factor: float) -> SequenceDict:
+    if speed_factor <= 0:
+        raise ValueError("speed_factor must be greater than zero")
+
+    if not sequence:
+        return {}
+
+    any_key = next(iter(sequence))
+    original_length = len(sequence[any_key])
+
+    if original_length == 0:
+        return {key: [] for key in sequence}
+
+    if np.isclose(speed_factor, 1.0):
+        return {key: list(frames) for key, frames in sequence.items()}
+
+    target_length = max(1, int(round(original_length / speed_factor)))
+    positions = np.linspace(0, max(original_length - 1, 0), target_length)
+
+    resampled: SequenceDict = {key: [] for key in sequence}
+
+    for identifier, frames in sequence.items():
+        for position in positions:
+            resampled[identifier].append(_interpolate_pair(frames, float(position)))
+
+    return resampled
 
 
 def load_pose_sequences(file_location: str) -> Tuple[Sequence[np.ndarray], Sequence[int]]:
@@ -55,17 +120,21 @@ def pose_tensor_to_dict(landmarks_array: np.ndarray) -> dict:
     return landmark_dictionary
 
 
-def pose_dict_to_tensor(landmarks_dict: dict) -> tf.Tensor:
+def pose_dict_to_array(landmarks_dict: dict) -> np.ndarray:
     sequence_length = len(landmarks_dict["leftEar"])
-    pose_tensor = np.empty(
+    pose_array = np.empty(
         shape=(sequence_length, len(ALL_IDENTIFIERS), 2), dtype=np.float32
     )
 
     for landmark_index, identifier in enumerate(ALL_IDENTIFIERS):
-        pose_tensor[:, landmark_index, 0] = [frame[0] for frame in landmarks_dict[identifier]]
-        pose_tensor[:, landmark_index, 1] = [frame[1] for frame in landmarks_dict[identifier]]
+        pose_array[:, landmark_index, 0] = [frame[0] for frame in landmarks_dict[identifier]]
+        pose_array[:, landmark_index, 1] = [frame[1] for frame in landmarks_dict[identifier]]
 
-    return tf.convert_to_tensor(pose_tensor, dtype=tf.float32)
+    return pose_array
+
+
+def pose_dict_to_tensor(landmarks_dict: dict) -> tf.Tensor:
+    return tf.convert_to_tensor(pose_dict_to_array(landmarks_dict), dtype=tf.float32)
 
 
 class SignPoseDataset:
@@ -76,6 +145,8 @@ class SignPoseDataset:
         dataset_filename: Optional[str] = None,
         augmentations_prob: float = 0.5,
         normalize: bool = True,
+        speed_up_factor: float = 1.5,
+        slow_down_factor: float = 0.5,
         data: Optional[np.ndarray] = None,
         lengths: Optional[np.ndarray] = None,
         labels: Optional[Sequence[int]] = None,
@@ -109,6 +180,8 @@ class SignPoseDataset:
         self.input_shape = (self.max_sequence_length, self.num_joints, 2)
         self.targets = self.labels.tolist()
         self.augmentations_prob = float(augmentations_prob)
+        self.speed_up_factor = float(speed_up_factor)
+        self.slow_down_factor = float(slow_down_factor)
 
         if dataset_filename is not None and normalize:
             self._normalize_sequences()
@@ -146,6 +219,8 @@ class SignPoseDataset:
             lengths=subset_lengths,
             labels=subset_labels,
             augmentations_prob=self.augmentations_prob,
+            speed_up_factor=self.speed_up_factor,
+            slow_down_factor=self.slow_down_factor,
             normalize=False,
         )
 
@@ -168,7 +243,7 @@ class SignPoseDataset:
             pose = tf.ensure_shape(pose, self.input_shape)
             mask = tf.sequence_mask(length, maxlen=self.max_sequence_length)
             if augment:
-                pose = self._maybe_augment(pose, mask)
+                pose, mask = self._maybe_augment(pose, mask)
             if gaussian_noise is not None:
                 pose = gaussian_noise(pose)
             return {"pose": pose, "mask": mask}, label
@@ -181,22 +256,29 @@ class SignPoseDataset:
     def steps_per_epoch(self, batch_size: int) -> int:
         return int(np.ceil(self.num_samples / batch_size))
 
-    def _maybe_augment(self, pose: tf.Tensor, mask: tf.Tensor) -> tf.Tensor:
+    def _maybe_augment(self, pose: tf.Tensor, mask: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
         probability = tf.random.uniform([], dtype=tf.float32)
         augment_tensor = tf.constant(self.augmentations_prob, dtype=tf.float32)
 
         def apply_augmentation():
-            choice = tf.random.uniform([], minval=0, maxval=4, dtype=tf.int32)
-            augmentations = {
-                0: lambda: self._rotate_frames(pose, mask, (-13.0, 13.0)),
-                1: lambda: self._shear_frames(pose, mask, axis="x", magnitude_range=(0.0, 0.15)),
-                2: lambda: self._shear_frames(pose, mask, axis="y", magnitude_range=(0.0, 0.1)),
-                3: lambda: self._rotate_random_arm(pose, mask),
-            }
-            augmented_pose = tf.switch_case(choice, branch_fns=augmentations)
-            return self._apply_mask(augmented_pose, mask)
+            choice = tf.random.uniform([], minval=0, maxval=6, dtype=tf.int32)
 
-        return tf.cond(probability < augment_tensor, apply_augmentation, lambda: pose)
+            def _mask_transform(transform_fn):
+                augmented_pose = transform_fn()
+                augmented_pose = self._apply_mask(augmented_pose, mask)
+                return augmented_pose, mask
+
+            augmentations = {
+                0: lambda: _mask_transform(lambda: self._rotate_frames(pose, mask, (-13.0, 13.0))),
+                1: lambda: _mask_transform(lambda: self._shear_frames(pose, mask, axis="x", magnitude_range=(0.0, 0.15))),
+                2: lambda: _mask_transform(lambda: self._shear_frames(pose, mask, axis="y", magnitude_range=(0.0, 0.1))),
+                3: lambda: _mask_transform(lambda: self._rotate_random_arm(pose, mask)),
+                4: lambda: self._temporal_resample(pose, mask, self.speed_up_factor),
+                5: lambda: self._temporal_resample(pose, mask, self.slow_down_factor),
+            }
+            return tf.switch_case(choice, branch_fns=augmentations)
+
+        return tf.cond(probability < augment_tensor, apply_augmentation, lambda: (pose, mask))
 
     @staticmethod
     def _apply_mask(pose: tf.Tensor, mask: tf.Tensor) -> tf.Tensor:
@@ -236,6 +318,28 @@ class SignPoseDataset:
         transformed_pose = tf.matmul(flattened_pose, transform)
         return tf.reshape(transformed_pose, original_shape)
 
+    def _temporal_resample(self, pose: tf.Tensor, mask: tf.Tensor, speed_factor: float) -> Tuple[tf.Tensor, tf.Tensor]:
+        sequence_length = tf.cast(tf.reduce_sum(tf.cast(mask, tf.int32)), tf.int32)
+
+        def _resample():
+            valid_pose = pose[:sequence_length]
+            factor = tf.constant(speed_factor, dtype=tf.float32)
+            resampled = tf.py_function(
+                func=SignPoseDataset._resample_numpy,
+                inp=[valid_pose, factor],
+                Tout=tf.float32,
+            )
+            resampled.set_shape([None, self.num_joints, 2])
+            max_length = tf.shape(pose)[0]
+            truncated = resampled[:max_length]
+            new_length = tf.shape(truncated)[0]
+            pad_length = tf.maximum(max_length - new_length, 0)
+            padded = tf.pad(truncated, [[0, pad_length], [0, 0], [0, 0]], constant_values=0.0)
+            new_mask = tf.sequence_mask(new_length, maxlen=max_length)
+            return padded, new_mask
+
+        return tf.cond(sequence_length > 0, _resample, lambda: (pose, mask))
+
     def _rotate_random_arm(self, pose: tf.Tensor, mask: tf.Tensor) -> tf.Tensor:
         arm_choice = tf.random.uniform([], minval=0, maxval=2, dtype=tf.int32)
         left_arm_indices = tf.constant([IDENTIFIER_TO_INDEX[name] for name in LEFT_ARM_IDENTIFIERS], dtype=tf.int32)
@@ -271,6 +375,19 @@ class SignPoseDataset:
         )
         updates = tf.reshape(updated_values, (-1, 2))
         return tf.tensor_scatter_nd_update(pose, scatter_indices, updates)
+
+    @staticmethod
+    def _resample_numpy(frames: np.ndarray, speed_factor: np.ndarray) -> np.ndarray:
+        if isinstance(frames, tf.Tensor):
+            frames = frames.numpy()
+        if isinstance(speed_factor, tf.Tensor):
+            speed_factor = speed_factor.numpy()
+        if frames.size == 0:
+            return frames.astype(np.float32)
+        factor = float(speed_factor)
+        pose_dict = pose_tensor_to_dict(frames)
+        resampled_dict = resample_sequence(pose_dict, factor)
+        return pose_dict_to_array(resampled_dict).astype(np.float32)
 
 
 if __name__ == "__main__":

@@ -28,9 +28,9 @@ class PlateauLearningRateScheduler:
 
         self.waiting_epochs += 1
         if self.waiting_epochs > self.patience:
-            current_lr = float(tf.keras.backend.get_value(self.optimizer.learning_rate))
+            current_lr = self.optimizer.learning_rate.numpy()
             updated_lr = max(current_lr * self.factor, self.min_lr)
-            tf.keras.backend.set_value(self.optimizer.learning_rate, updated_lr)
+            self.optimizer.learning_rate.assign(tf.cast(updated_lr, tf.float32))
             self.waiting_epochs = 0
 
 
