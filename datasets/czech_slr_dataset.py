@@ -1,10 +1,12 @@
 import ast
-import torch
-
-import pandas as pd
-import torch.utils.data as torch_data
-
+import random
 from random import randrange
+from typing import Callable, List, Optional, Sequence
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+
 from augmentations import *
 from normalization.body_normalization import BODY_IDENTIFIERS
 from normalization.hand_normalization import HAND_IDENTIFIERS
@@ -31,7 +33,10 @@ def load_dataset(file_location: str):
     data = []
 
     for row_index, row in df.iterrows():
-        current_row = np.empty(shape=(len(ast.literal_eval(row["leftEar_X"])), len(BODY_IDENTIFIERS + HAND_IDENTIFIERS), 2))
+        current_row = np.empty(
+            shape=(len(ast.literal_eval(row["leftEar_X"])), len(BODY_IDENTIFIERS + HAND_IDENTIFIERS), 2),
+            dtype=np.float32,
+        )
         for index, identifier in enumerate(BODY_IDENTIFIERS + HAND_IDENTIFIERS):
             current_row[:, index, 0] = ast.literal_eval(row[identifier + "_X"])
             current_row[:, index, 1] = ast.literal_eval(row[identifier + "_Y"])
@@ -41,37 +46,52 @@ def load_dataset(file_location: str):
     return data, labels
 
 
-def tensor_to_dictionary(landmarks_tensor: torch.Tensor) -> dict:
+def tensor_to_dictionary(landmarks_array: np.ndarray) -> dict:
 
-    data_array = landmarks_tensor.numpy()
+    data_array = np.asarray(landmarks_array)
     output = {}
 
     for landmark_index, identifier in enumerate(BODY_IDENTIFIERS + HAND_IDENTIFIERS):
-        output[identifier] = data_array[:, landmark_index]
+        output[identifier] = [
+            (float(frame[0]), float(frame[1])) for frame in data_array[:, landmark_index]
+        ]
 
     return output
 
 
-def dictionary_to_tensor(landmarks_dict: dict) -> torch.Tensor:
+def dictionary_to_tensor(landmarks_dict: dict) -> tf.Tensor:
 
-    output = np.empty(shape=(len(landmarks_dict["leftEar"]), len(BODY_IDENTIFIERS + HAND_IDENTIFIERS), 2))
+    sequence_length = len(landmarks_dict["leftEar"])
+    output = np.empty(
+        shape=(sequence_length, len(BODY_IDENTIFIERS + HAND_IDENTIFIERS), 2), dtype=np.float32
+    )
 
     for landmark_index, identifier in enumerate(BODY_IDENTIFIERS + HAND_IDENTIFIERS):
         output[:, landmark_index, 0] = [frame[0] for frame in landmarks_dict[identifier]]
         output[:, landmark_index, 1] = [frame[1] for frame in landmarks_dict[identifier]]
 
-    return torch.from_numpy(output)
+    return tf.convert_to_tensor(output, dtype=tf.float32)
 
 
-class CzechSLRDataset(torch_data.Dataset):
+class CzechSLRDataset:
     """Advanced object representation of the HPOES dataset for loading hand joints landmarks utilizing the Torch's
     built-in Dataset properties"""
 
-    data: [np.ndarray]
-    labels: [np.ndarray]
+    data: List[np.ndarray]
+    labels: List[int]
 
-    def __init__(self, dataset_filename: str, num_labels=5, transform=None, augmentations=False,
-                 augmentations_prob=0.5, normalize=True):
+    def __init__(
+            self,
+            dataset_filename: Optional[str] = None,
+            num_labels: int = 5,
+            transform: Optional[Callable[[tf.Tensor], tf.Tensor]] = None,
+            augmentations: bool = False,
+            augmentations_prob: float = 0.5,
+            normalize: bool = True,
+            data: Optional[Sequence[np.ndarray]] = None,
+            labels: Optional[Sequence[int]] = None,
+            indices: Optional[Sequence[int]] = None,
+    ):
         """
         Initiates the HPOESDataset with the pre-loaded data from the h5 file.
 
@@ -79,12 +99,23 @@ class CzechSLRDataset(torch_data.Dataset):
         :param transform: Any data transformation to be applied (default: None)
         """
 
-        loaded_data = load_dataset(dataset_filename)
-        data, labels = loaded_data[0], loaded_data[1]
+        if data is not None and labels is not None:
+            self._base_data = list(data)
+            self._base_labels = list(labels)
+        elif dataset_filename is not None:
+            loaded_data = load_dataset(dataset_filename)
+            self._base_data, self._base_labels = list(loaded_data[0]), list(loaded_data[1])
+        else:
+            raise ValueError("Either dataset_filename or data/labels must be provided.")
 
-        self.data = data
-        self.labels = labels
-        self.targets = list(labels)
+        if indices is None:
+            self.indices = list(range(len(self._base_data)))
+        else:
+            self.indices = list(indices)
+
+        self.data = self._base_data
+        self.labels = self._base_labels
+        self.targets = [self._base_labels[i] for i in self.indices]
         self.num_labels = num_labels
         self.transform = transform
 
@@ -92,7 +123,7 @@ class CzechSLRDataset(torch_data.Dataset):
         self.augmentations_prob = augmentations_prob
         self.normalize = normalize
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         """
         Allocates, potentially transforms and returns the item at the desired index.
 
@@ -100,8 +131,9 @@ class CzechSLRDataset(torch_data.Dataset):
         :return: Tuple containing both the depth map and the label
         """
 
-        depth_map = torch.from_numpy(np.copy(self.data[idx]))
-        label = torch.Tensor([self.labels[idx] - 1])
+        base_index = self.indices[idx]
+        depth_map = np.copy(self.data[base_index])
+        label = tf.convert_to_tensor(self.labels[base_index] - 1, dtype=tf.int32)
 
         depth_map = tensor_to_dictionary(depth_map)
 
@@ -137,7 +169,19 @@ class CzechSLRDataset(torch_data.Dataset):
         return depth_map, label
 
     def __len__(self):
-        return len(self.labels)
+        return len(self.indices)
+
+    def subset(self, subset_indices: Sequence[int]):
+        return CzechSLRDataset(
+            num_labels=self.num_labels,
+            transform=self.transform,
+            augmentations=self.augmentations,
+            augmentations_prob=self.augmentations_prob,
+            normalize=self.normalize,
+            data=self._base_data,
+            labels=self._base_labels,
+            indices=[self.indices[i] for i in subset_indices],
+        )
 
 
 if __name__ == "__main__":
