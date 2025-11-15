@@ -5,3 +5,4 @@ tensorflow==2.13.0
 tensorflow-model-optimization==0.7.5
 scikit-learn
 opencv-python
+mediapipe
