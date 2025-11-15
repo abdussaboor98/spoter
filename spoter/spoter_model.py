@@ -32,8 +32,13 @@ class SpoterEncoderLayer(tf.keras.layers.Layer):
 
     def call(self, encoder_input: tf.Tensor, training: bool = False,
              mask: Optional[tf.Tensor] = None) -> tf.Tensor:
-        attention_output = self.self_attention(encoder_input, encoder_input, encoder_input,
-                                               attention_mask=mask, training=training)
+        attention_output = self.self_attention(
+            encoder_input,
+            encoder_input,
+            encoder_input,
+            attention_mask=mask,
+            training=training,
+        )
         encoder_input = self.layer_norm_after_attention(
             encoder_input + self.dropout_after_attention(attention_output, training=training)
         )
@@ -134,10 +139,11 @@ class SpoterEncoderStack(tf.keras.layers.Layer):
             for _ in range(num_layers)
         ]
 
-    def call(self, encoder_input: tf.Tensor, training: bool = False) -> tf.Tensor:
+    def call(self, encoder_input: tf.Tensor, training: bool = False,
+             attention_mask: Optional[tf.Tensor] = None) -> tf.Tensor:
         output = encoder_input
         for layer in self.layers:
-            output = layer(output, training=training)
+            output = layer(output, training=training, mask=attention_mask)
         return output
 
     def get_config(self):
@@ -171,10 +177,11 @@ class SpoterDecoderStack(tf.keras.layers.Layer):
             for _ in range(num_layers)
         ]
 
-    def call(self, decoder_query: tf.Tensor, memory: tf.Tensor, training: bool = False) -> tf.Tensor:
+    def call(self, decoder_query: tf.Tensor, memory: tf.Tensor, training: bool = False,
+             memory_mask: Optional[tf.Tensor] = None) -> tf.Tensor:
         output = decoder_query
         for layer in self.layers:
-            output = layer(output, memory, training=training)
+            output = layer(output, memory, training=training, memory_mask=memory_mask)
         return output
 
     def get_config(self):
@@ -241,7 +248,8 @@ class SPOTER(tf.keras.Model):
         )
         self.classifier = tf.keras.layers.Dense(num_classes)
 
-    def call(self, inputs: tf.Tensor, training: bool = False) -> tf.Tensor:
+    def call(self, inputs: tf.Tensor, training: bool = False,
+             attention_mask: Optional[tf.Tensor] = None) -> tf.Tensor:
         inputs = tf.cast(inputs, tf.float32)
         batch_size = tf.shape(inputs)[0]
         sequence_length = tf.shape(inputs)[1]
@@ -258,13 +266,26 @@ class SPOTER(tf.keras.Model):
         ]):
             encoder_input = tf.reshape(flattened_inputs, (batch_size, sequence_length, self.hidden_dim))
 
+        if attention_mask is not None:
+            attention_mask = tf.cast(attention_mask, tf.bool)
+            attention_mask = attention_mask[:, tf.newaxis, tf.newaxis, :]
+
         positional_encoding = tf.broadcast_to(self.positional_embedding,
                                               (batch_size, sequence_length, self.hidden_dim))
-        encoder_memory = self.encoder(encoder_input + positional_encoding, training=training)
+        encoder_memory = self.encoder(
+            encoder_input + positional_encoding,
+            training=training,
+            attention_mask=attention_mask,
+        )
 
         class_token = tf.broadcast_to(self.classification_token, (batch_size, self.hidden_dim))
         class_token = tf.expand_dims(class_token, axis=1)
-        decoder_output = self.decoder(class_token, encoder_memory, training=training)
+        decoder_output = self.decoder(
+            class_token,
+            encoder_memory,
+            training=training,
+            memory_mask=attention_mask,
+        )
         class_logits = self.classifier(decoder_output)
         return class_logits
 

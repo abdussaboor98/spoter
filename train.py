@@ -11,7 +11,7 @@ import matplotlib.ticker as ticker
 from tqdm.auto import tqdm
 
 from utils import stratified_train_validation_split, select_training_subset
-from datasets.czech_slr_dataset import CzechSignLanguageDataset
+from datasets.sign_pose_dataset import SignPoseDataset
 from spoter.spoter_model import SPOTER
 from spoter.utils import train_single_epoch, evaluate_model, PlateauLearningRateScheduler
 from spoter.gaussian_noise import AdditiveGaussianNoise
@@ -45,6 +45,7 @@ def build_training_arg_parser():
     # Training hyperparameters
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train the model for")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate for the model training")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size used for training and evaluation dataloaders")
     parser.add_argument("--log_freq", type=int, default=1,
                         help="Log frequency (frequency of printing all the training info)")
 
@@ -108,27 +109,52 @@ def run_training(args):
     Path("out-checkpoints/" + args.experiment_name + "/").mkdir(parents=True, exist_ok=True)
     Path("out-img/").mkdir(parents=True, exist_ok=True)
 
-    transform = AdditiveGaussianNoise(args.gaussian_mean, args.gaussian_std)
-    training_dataset = CzechSignLanguageDataset(args.training_set_path, transform=transform, augmentations=True)
+    gaussian_noise = AdditiveGaussianNoise(args.gaussian_mean, args.gaussian_std)
+    training_dataset = SignPoseDataset(args.training_set_path)
 
     if args.validation_set == "from-file":
-        validation_dataset = CzechSignLanguageDataset(args.validation_set_path)
+        validation_dataset = SignPoseDataset(args.validation_set_path)
     elif args.validation_set == "split-from-train":
         training_dataset, validation_dataset = stratified_train_validation_split(training_dataset, args.validation_set_size or 0.2)
-        validation_dataset.transform = None
-        validation_dataset.augmentations = False
     else:
         validation_dataset = None
 
     if args.testing_set_path:
-        test_dataset = CzechSignLanguageDataset(args.testing_set_path)
+        test_dataset = SignPoseDataset(args.testing_set_path)
     else:
         test_dataset = None
 
     if args.experimental_train_split:
         training_dataset = select_training_subset(training_dataset, args.experimental_train_split)
 
-    sample_shape = tuple(training_dataset[0][0].shape)
+    train_tf_dataset = training_dataset.as_tf_dataset(
+        batch_size=args.batch_size,
+        shuffle=True,
+        augment=True,
+        gaussian_noise=gaussian_noise,
+    )
+
+    if validation_dataset:
+        validation_tf_dataset = validation_dataset.as_tf_dataset(
+            batch_size=args.batch_size,
+            shuffle=False,
+            augment=False,
+        )
+    else:
+        validation_tf_dataset = None
+
+    has_validation = validation_tf_dataset is not None
+
+    if test_dataset:
+        test_tf_dataset = test_dataset.as_tf_dataset(
+            batch_size=args.batch_size,
+            shuffle=False,
+            augment=False,
+        )
+    else:
+        test_tf_dataset = None
+
+    sample_shape = training_dataset.input_shape
 
     spoter_model = _initialize_model(args, sample_shape)
 
@@ -156,18 +182,23 @@ def run_training(args):
     for epoch in epoch_bar:
         epoch_loss, _, _, training_accuracy = train_single_epoch(
             spoter_model,
-            training_dataset,
+            train_tf_dataset,
             loss_function,
             optimizer,
             scheduler,
             show_sample_progress=True,
             epoch_description=f"Epoch {epoch + 1}/{args.epochs}",
+            steps_per_epoch=training_dataset.steps_per_epoch(args.batch_size),
         )
-        epoch_losses.append(epoch_loss / len(training_dataset))
+        epoch_losses.append(epoch_loss)
         training_accuracies.append(training_accuracy)
 
-        if validation_dataset:
-            validation_correct, validation_total, validation_accuracy = evaluate_model(spoter_model, validation_dataset)
+        if has_validation:
+            validation_correct, validation_total, validation_accuracy = evaluate_model(
+                spoter_model,
+                validation_tf_dataset,
+                args.num_classes,
+            )
             validation_accuracies.append(validation_accuracy)
 
         metrics_postfix = {
@@ -175,7 +206,7 @@ def run_training(args):
             "train_acc": f"{training_accuracy:.4f}",
         }
 
-        if validation_dataset:
+        if has_validation:
             metrics_postfix["val_acc"] = f"{validation_accuracy:.4f}"
 
         epoch_bar.set_postfix(metrics_postfix)
@@ -183,19 +214,19 @@ def run_training(args):
         if args.save_checkpoints:
             if training_accuracy > best_training_accuracy:
                 best_training_accuracy = training_accuracy
-                checkpoint_path = f"out-checkpoints/{args.experiment_name}/checkpoint_t_{checkpoint_rotation_index}.ckpt"
+                checkpoint_path = f"out-checkpoints/{args.experiment_name}/checkpoint_t_{checkpoint_rotation_index}.weights.h5"
                 spoter_model.save_weights(checkpoint_path)
 
-            if validation_dataset and validation_accuracy > best_validation_accuracy:
+            if has_validation and validation_accuracy > best_validation_accuracy:
                 best_validation_accuracy = validation_accuracy
-                checkpoint_path = f"out-checkpoints/{args.experiment_name}/checkpoint_v_{checkpoint_rotation_index}.ckpt"
+                checkpoint_path = f"out-checkpoints/{args.experiment_name}/checkpoint_v_{checkpoint_rotation_index}.weights.h5"
                 spoter_model.save_weights(checkpoint_path)
 
         if epoch % args.log_freq == 0:
             tqdm.write("[" + str(epoch + 1) + "] TRAIN  loss: " + str(epoch_losses[-1]) + " acc: " + str(training_accuracy))
             logging.info("[" + str(epoch + 1) + "] TRAIN  loss: " + str(epoch_losses[-1]) + " acc: " + str(training_accuracy))
 
-            if validation_dataset:
+            if has_validation:
                 tqdm.write("[" + str(epoch + 1) + "] VALIDATION  acc: " + str(validation_accuracy))
                 logging.info("[" + str(epoch + 1) + "] VALIDATION  acc: " + str(validation_accuracy))
 
@@ -213,22 +244,22 @@ def run_training(args):
 
     best_test_accuracy, best_checkpoint_name = 0, ""
 
-    if test_dataset:
+    if test_tf_dataset is not None:
         for i in range(checkpoint_rotation_index):
             for checkpoint_id in ["t", "v"]:
-                checkpoint_path = f"out-checkpoints/{args.experiment_name}/checkpoint_{checkpoint_id}_{i}.ckpt"
-                if not os.path.exists(checkpoint_path + ".index"):
+                checkpoint_path = f"out-checkpoints/{args.experiment_name}/checkpoint_{checkpoint_id}_{i}.weights.h5"
+                if not os.path.exists(checkpoint_path):
                     continue
 
                 evaluation_model = _initialize_model(args)
                 dummy_input = tf.zeros((1,) + sample_shape, dtype=tf.float32)
                 evaluation_model(dummy_input, training=False)
                 evaluation_model.load_weights(checkpoint_path)
-                _, _, test_accuracy = evaluate_model(evaluation_model, test_dataset, print_stats=True)
+                _, _, test_accuracy = evaluate_model(evaluation_model, test_tf_dataset, args.num_classes, print_stats=True)
 
                 if test_accuracy > best_test_accuracy:
                     best_test_accuracy = test_accuracy
-                    best_checkpoint_name = args.experiment_name + f"/checkpoint_{checkpoint_id}_{i}"
+                    best_checkpoint_name = f"{args.experiment_name}/checkpoint_{checkpoint_id}_{i}.weights.h5"
 
                 print(f"checkpoint_{checkpoint_id}_{i}  ->  {test_accuracy}")
                 logging.info(f"checkpoint_{checkpoint_id}_{i}  ->  {test_accuracy}")

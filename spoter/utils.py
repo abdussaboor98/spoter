@@ -34,99 +34,94 @@ class PlateauLearningRateScheduler:
             self.waiting_epochs = 0
 
 
-def _ensure_batch_dimension(inputs: tf.Tensor) -> tf.Tensor:
-    if tf.rank(inputs) == 3:
-        return tf.expand_dims(inputs, axis=0)
-    return inputs
-
-
-def _ensure_label_batch(labels: tf.Tensor) -> tf.Tensor:
-    if tf.rank(labels) == 0:
-        return tf.expand_dims(labels, axis=0)
-    return labels
-
-
-def train_single_epoch(model: tf.keras.Model, dataset, loss_fn, optimizer,
+def train_single_epoch(model: tf.keras.Model, dataset: tf.data.Dataset, loss_fn, optimizer,
                        scheduler: Optional[PlateauLearningRateScheduler] = None,
-                       show_sample_progress: bool = False, epoch_description: Optional[str] = None):
+                       show_sample_progress: bool = False, epoch_description: Optional[str] = None,
+                       steps_per_epoch: Optional[int] = None):
     correct_predictions, total_predictions = 0, 0
     cumulative_loss = 0.0
 
-    sample_indices = np.random.permutation(len(dataset))
-    progress_iterator = sample_indices
-    sample_bar = None
-    processed_samples = 0
+    progress_iterator = dataset
+    batch_bar = None
 
     if show_sample_progress:
-        sample_bar = tqdm(
-            sample_indices,
-            desc=epoch_description or "Training samples",
+        batch_bar = tqdm(
+            dataset,
+            desc=epoch_description or "Training",
             leave=False,
-            unit="sample",
+            total=steps_per_epoch,
+            unit="batch",
         )
-        progress_iterator = sample_bar
+        progress_iterator = batch_bar
 
-    for sample_index in progress_iterator:
-        features, labels = dataset[sample_index]
-        batched_inputs = _ensure_batch_dimension(features)
-        batched_labels = _ensure_label_batch(labels)
-
+    for batch_inputs, batch_labels in progress_iterator:
+        mask = batch_inputs["mask"]
+        features = batch_inputs["pose"]
         with tf.GradientTape() as tape:
-            logits = model(batched_inputs, training=True)
+            logits = model(features, training=True, attention_mask=mask)
             logits = tf.squeeze(logits, axis=1)
-            loss = loss_fn(batched_labels, logits)
+            loss = loss_fn(batch_labels, logits)
 
         gradients = tape.gradient(loss, model.trainable_variables)
         optimizer.apply_gradients(zip(gradients, model.trainable_variables))
 
-        cumulative_loss += float(loss.numpy())
+        batch_size = int(batch_labels.shape[0])
+        cumulative_loss += float(loss.numpy()) * batch_size
 
         predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
-        correct_predictions += int(tf.reduce_sum(tf.cast(tf.equal(predictions, batched_labels), tf.int32)))
-        total_predictions += int(batched_labels.shape[0])
+        correct_predictions += int(tf.reduce_sum(tf.cast(tf.equal(predictions, batch_labels), tf.int32)))
+        total_predictions += batch_size
 
-        processed_samples += 1
-
-        if sample_bar is not None:
-            running_loss = cumulative_loss / processed_samples
+        if batch_bar is not None:
+            running_loss = (cumulative_loss / total_predictions) if total_predictions else 0.0
             running_accuracy = (correct_predictions / total_predictions) if total_predictions else 0.0
-            sample_bar.set_postfix({
+            batch_bar.set_postfix({
                 "loss": f"{running_loss:.4f}",
                 "acc": f"{running_accuracy:.4f}",
             })
 
-    if scheduler:
-        scheduler.step(cumulative_loss / len(dataset))
+    mean_loss = (cumulative_loss / total_predictions) if total_predictions else 0.0
 
-    if sample_bar is not None:
-        sample_bar.close()
+    if scheduler:
+        scheduler.step(mean_loss)
+
+    if batch_bar is not None:
+        batch_bar.close()
 
     accuracy = (correct_predictions / total_predictions) if total_predictions else 0.0
-    return cumulative_loss, correct_predictions, total_predictions, accuracy
+    return mean_loss, correct_predictions, total_predictions, accuracy
 
 
-def evaluate_model(model: tf.keras.Model, dataset, print_stats: bool = False):
+def evaluate_model(model: tf.keras.Model, dataset: tf.data.Dataset, num_classes: int,
+                   print_stats: bool = False):
     correct_predictions, total_predictions = 0, 0
-    class_level_stats = {i: [0, 0] for i in range(101)}
+    class_level_correct = np.zeros(num_classes, dtype=np.int32)
+    class_level_total = np.zeros(num_classes, dtype=np.int32)
 
-    for sample_index in range(len(dataset)):
-        features, labels = dataset[sample_index]
-        batched_inputs = _ensure_batch_dimension(features)
-        batched_labels = _ensure_label_batch(labels)
-
-        logits = model(batched_inputs, training=False)
+    for batch_inputs, batch_labels in dataset:
+        mask = batch_inputs["mask"]
+        features = batch_inputs["pose"]
+        logits = model(features, training=False, attention_mask=mask)
         logits = tf.squeeze(logits, axis=1)
         predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
 
-        for predicted_label, target_label in zip(predictions.numpy(), batched_labels.numpy()):
+        predicted_array = predictions.numpy()
+        labels_array = batch_labels.numpy()
+
+        correct_predictions += int(np.sum(predicted_array == labels_array))
+        total_predictions += labels_array.shape[0]
+
+        for target_label, predicted_label in zip(labels_array, predicted_array):
+            class_level_total[int(target_label)] += 1
             if int(predicted_label) == int(target_label):
-                class_level_stats[int(target_label)][0] += 1
-                correct_predictions += 1
-            class_level_stats[int(target_label)][1] += 1
-            total_predictions += 1
+                class_level_correct[int(target_label)] += 1
 
     if print_stats:
-        label_statistics = {key: value[0] / value[1] for key, value in class_level_stats.items() if value[1] != 0}
+        label_statistics = {
+            index: class_level_correct[index] / class_level_total[index]
+            for index in range(num_classes)
+            if class_level_total[index] > 0
+        }
         print("Label accuracies statistics:")
         print(str(label_statistics) + "\n")
         logging.info("Label accuracies statistics:")
@@ -136,22 +131,20 @@ def evaluate_model(model: tf.keras.Model, dataset, print_stats: bool = False):
     return correct_predictions, total_predictions, accuracy
 
 
-def evaluate_top_k_accuracy(model: tf.keras.Model, dataset, k: int = 5):
+def evaluate_top_k_accuracy(model: tf.keras.Model, dataset: tf.data.Dataset, k: int = 5):
     correct_predictions, total_predictions = 0, 0
 
-    for sample_index in range(len(dataset)):
-        features, labels = dataset[sample_index]
-        batched_inputs = _ensure_batch_dimension(features)
-        batched_labels = _ensure_label_batch(labels)
-
-        logits = model(batched_inputs, training=False)
+    for batch_inputs, batch_labels in dataset:
+        mask = batch_inputs["mask"]
+        features = batch_inputs["pose"]
+        logits = model(features, training=False, attention_mask=mask)
         logits = tf.squeeze(logits, axis=1)
         top_k_results = tf.math.top_k(logits, k=k)
 
         top_k_indices = top_k_results.indices.numpy()
-        label_array = batched_labels.numpy()
+        labels_array = batch_labels.numpy()
 
-        for row_index, target_label in enumerate(label_array):
+        for row_index, target_label in enumerate(labels_array):
             if int(target_label) in top_k_indices[row_index]:
                 correct_predictions += 1
             total_predictions += 1
