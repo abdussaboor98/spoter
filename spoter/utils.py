@@ -33,6 +33,19 @@ class PlateauLearningRateScheduler:
             self.optimizer.learning_rate.assign(tf.cast(updated_lr, tf.float32))
             self.waiting_epochs = 0
 
+    def get_state(self):
+        return {
+            "best_metric": float(self.best_metric) if np.isfinite(self.best_metric) else None,
+            "waiting_epochs": int(self.waiting_epochs),
+        }
+
+    def set_state(self, state):
+        if not state:
+            return
+        best_metric = state.get("best_metric")
+        self.best_metric = float(best_metric) if best_metric is not None else np.inf
+        self.waiting_epochs = int(state.get("waiting_epochs", 0))
+
 
 def train_single_epoch(model: tf.keras.Model, dataset: tf.data.Dataset, loss_fn, optimizer,
                        scheduler: Optional[PlateauLearningRateScheduler] = None,

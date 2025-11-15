@@ -2,6 +2,7 @@ import os
 import argparse
 import random
 import logging
+import json
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +11,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from tqdm.auto import tqdm
 
-from utils import stratified_train_validation_split, select_training_subset
+from utils import select_training_subset, user_gesture_repetition_validation_split
 from datasets.sign_pose_dataset import SignPoseDataset
 from spoter.spoter_model import SPOTER
 from spoter.utils import train_single_epoch, evaluate_model, PlateauLearningRateScheduler
@@ -48,6 +49,8 @@ def build_training_arg_parser():
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size used for training and evaluation dataloaders")
     parser.add_argument("--log_freq", type=int, default=1,
                         help="Log frequency (frequency of printing all the training info)")
+    parser.add_argument("--early_stopping_patience", type=int, default=10,
+                        help="Number of epochs without validation improvement before stopping early. Set to 0 to disable.")
 
     # Checkpointing
     parser.add_argument("--save_checkpoints", type=bool, default=True,
@@ -82,6 +85,18 @@ def _configure_logging(args):
     )
 
 
+def _load_training_state(state_path: Path) -> dict:
+    if not state_path.is_file():
+        return {}
+    with open(state_path, "r", encoding="utf-8") as state_file:
+        return json.load(state_file)
+
+
+def _save_training_state(state_path: Path, state: dict):
+    with open(state_path, "w", encoding="utf-8") as state_file:
+        json.dump(state, state_file)
+
+
 def _set_random_seeds(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -106,8 +121,13 @@ def run_training(args):
     accelerator_type = "GPU" if tf.config.list_physical_devices("GPU") else "CPU"
     print(f"Using {accelerator_type} for training.")
 
-    Path("out-checkpoints/" + args.experiment_name + "/").mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = Path("out-checkpoints") / args.experiment_name
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     Path("out-img/").mkdir(parents=True, exist_ok=True)
+
+    state_path = checkpoint_dir / "training_state.json"
+    latest_checkpoint_path = checkpoint_dir / "checkpoint_latest.weights.h5"
+    training_state = _load_training_state(state_path)
 
     gaussian_noise = AdditiveGaussianNoise(args.gaussian_mean, args.gaussian_std)
     training_dataset = SignPoseDataset(args.training_set_path)
@@ -115,7 +135,11 @@ def run_training(args):
     if args.validation_set == "from-file":
         validation_dataset = SignPoseDataset(args.validation_set_path)
     elif args.validation_set == "split-from-train":
-        training_dataset, validation_dataset = stratified_train_validation_split(training_dataset, args.validation_set_size or 0.2)
+        training_dataset, validation_dataset = user_gesture_repetition_validation_split(
+            training_dataset,
+            args.training_set_path,
+            seed=args.seed,
+        )
     else:
         validation_dataset = None
 
@@ -165,11 +189,17 @@ def run_training(args):
     dummy_input = tf.zeros((1,) + sample_shape, dtype=tf.float32)
     spoter_model(dummy_input, training=False)
 
-    training_accuracy, validation_accuracy = 0, 0
-    epoch_losses, training_accuracies, validation_accuracies = [], [], []
-    learning_rate_history = []
-    best_training_accuracy, best_validation_accuracy = 0, 0
-    checkpoint_rotation_index = 0
+    epoch_losses = list(training_state.get("epoch_losses", []))
+    training_accuracies = list(training_state.get("training_accuracies", []))
+    validation_accuracies = list(training_state.get("validation_accuracies", []))
+    learning_rate_history = list(training_state.get("learning_rate_history", []))
+    best_training_accuracy = float(training_state.get("best_training_accuracy", 0))
+    best_validation_accuracy = float(training_state.get("best_validation_accuracy", 0))
+    checkpoint_rotation_index = int(training_state.get("checkpoint_rotation_index", 0))
+    epochs_without_improvement = int(training_state.get("epochs_without_improvement", 0))
+    start_epoch = int(training_state.get("next_epoch", 0))
+    training_accuracy = training_accuracies[-1] if training_accuracies else 0
+    validation_accuracy = validation_accuracies[-1] if validation_accuracies else 0
 
     if args.experimental_train_split:
         print("Starting " + args.experiment_name + "_" + str(args.experimental_train_split).replace(".", "") + "...\n\n")
@@ -178,7 +208,18 @@ def run_training(args):
         print("Starting " + args.experiment_name + "...\n\n")
         logging.info("Starting " + args.experiment_name + "...\n\n")
 
-    epoch_bar = tqdm(range(args.epochs), desc="Epochs", unit="epoch")
+    if latest_checkpoint_path.exists() and start_epoch > 0:
+        spoter_model.load_weights(str(latest_checkpoint_path))
+        if training_state.get("scheduler_state"):
+            scheduler.set_state(training_state["scheduler_state"])
+        if "current_learning_rate" in training_state:
+            optimizer.learning_rate.assign(tf.cast(training_state["current_learning_rate"], tf.float32))
+        resume_message = f"Resuming {args.experiment_name} from epoch {start_epoch + 1}"
+        print(resume_message)
+        logging.info(resume_message)
+
+    epoch_bar = tqdm(range(start_epoch, args.epochs), desc="Epochs", unit="epoch")
+    early_stop_epoch = None
     for epoch in epoch_bar:
         epoch_loss, _, _, training_accuracy = train_single_epoch(
             spoter_model,
@@ -211,16 +252,19 @@ def run_training(args):
 
         epoch_bar.set_postfix(metrics_postfix)
 
-        if args.save_checkpoints:
-            if training_accuracy > best_training_accuracy:
-                best_training_accuracy = training_accuracy
-                checkpoint_path = f"out-checkpoints/{args.experiment_name}/checkpoint_t_{checkpoint_rotation_index}.weights.h5"
-                spoter_model.save_weights(checkpoint_path)
+        if args.save_checkpoints and training_accuracy > best_training_accuracy:
+            best_training_accuracy = training_accuracy
+            checkpoint_path = f"out-checkpoints/{args.experiment_name}/checkpoint_t_{checkpoint_rotation_index}.weights.h5"
+            spoter_model.save_weights(checkpoint_path)
 
-            if has_validation and validation_accuracy > best_validation_accuracy:
-                best_validation_accuracy = validation_accuracy
+        if has_validation and validation_accuracy > best_validation_accuracy:
+            best_validation_accuracy = validation_accuracy
+            if args.save_checkpoints:
                 checkpoint_path = f"out-checkpoints/{args.experiment_name}/checkpoint_v_{checkpoint_rotation_index}.weights.h5"
                 spoter_model.save_weights(checkpoint_path)
+            epochs_without_improvement = 0
+        elif has_validation and args.early_stopping_patience > 0:
+            epochs_without_improvement += 1
 
         if epoch % args.log_freq == 0:
             tqdm.write("[" + str(epoch + 1) + "] TRAIN  loss: " + str(epoch_losses[-1]) + " acc: " + str(training_accuracy))
@@ -238,6 +282,33 @@ def run_training(args):
             checkpoint_rotation_index += 1
 
         learning_rate_history.append(float(tf.keras.backend.get_value(optimizer.learning_rate)))
+
+        if has_validation and args.early_stopping_patience > 0 and epochs_without_improvement >= args.early_stopping_patience:
+            early_stop_epoch = epoch + 1
+
+        spoter_model.save_weights(str(latest_checkpoint_path))
+        scheduler_state = scheduler.get_state() if scheduler else None
+        _save_training_state(state_path, {
+            "next_epoch": epoch + 1,
+            "epoch_losses": epoch_losses,
+            "training_accuracies": training_accuracies,
+            "validation_accuracies": validation_accuracies,
+            "learning_rate_history": learning_rate_history,
+            "best_training_accuracy": best_training_accuracy,
+            "best_validation_accuracy": best_validation_accuracy,
+            "checkpoint_rotation_index": checkpoint_rotation_index,
+            "epochs_without_improvement": epochs_without_improvement,
+            "scheduler_state": scheduler_state,
+            "current_learning_rate": float(tf.keras.backend.get_value(optimizer.learning_rate)),
+        })
+
+        if early_stop_epoch is not None:
+            break
+
+    if early_stop_epoch is not None:
+        stop_msg = f"Early stopping triggered at epoch {early_stop_epoch}"
+        print(stop_msg)
+        logging.info(stop_msg)
 
     print("\nTesting checkpointed models starting...\n")
     logging.info("\nTesting checkpointed models starting...\n")
