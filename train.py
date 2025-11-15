@@ -9,14 +9,14 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-from utils import __balance_val_split, __split_of_train_sequence
-from datasets.czech_slr_dataset import CzechSLRDataset
+from utils import stratified_train_validation_split, select_training_subset
+from datasets.czech_slr_dataset import CzechSignLanguageDataset
 from spoter.spoter_model import SPOTER, create_quantization_aware_spoter
-from spoter.utils import train_epoch, evaluate, ReduceLROnPlateau
-from spoter.gaussian_noise import GaussianNoise
+from spoter.utils import train_single_epoch, evaluate_model, PlateauLearningRateScheduler
+from spoter.gaussian_noise import AdditiveGaussianNoise
 
 
-def get_default_args():
+def build_training_arg_parser():
     parser = argparse.ArgumentParser(add_help=False)
 
     parser.add_argument("--experiment_name", type=str, default="lsa_64_spoter",
@@ -52,9 +52,9 @@ def get_default_args():
                         help="Determines whether to save weights checkpoints")
 
     # Scheduler
-    parser.add_argument("--scheduler_factor", type=float, default=0.1, help="Factor for the ReduceLROnPlateau scheduler")
+    parser.add_argument("--scheduler_factor", type=float, default=0.1, help="Factor for the PlateauLearningRateScheduler scheduler")
     parser.add_argument("--scheduler_patience", type=int, default=5,
-                        help="Patience for the ReduceLROnPlateau scheduler")
+                        help="Patience for the PlateauLearningRateScheduler scheduler")
 
     # Gaussian noise normalization
     parser.add_argument("--gaussian_mean", type=float, default=0, help="Mean parameter for Gaussian noise layer")
@@ -74,7 +74,7 @@ def get_default_args():
     return parser
 
 
-def _setup_logging(args):
+def _configure_logging(args):
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -84,14 +84,14 @@ def _setup_logging(args):
     )
 
 
-def _set_seeds(seed: int):
+def _set_random_seeds(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     tf.random.set_seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
-def _build_model(args: argparse.Namespace, sample_shape=None) -> SPOTER:
+def _initialize_model(args: argparse.Namespace, sample_shape=None) -> SPOTER:
     model_kwargs = dict(
         num_classes=args.num_classes,
         hidden_dim=args.hidden_dim,
@@ -109,53 +109,53 @@ def _build_model(args: argparse.Namespace, sample_shape=None) -> SPOTER:
     return model
 
 
-def train(args):
-    _set_seeds(args.seed)
-    _setup_logging(args)
+def run_training(args):
+    _set_random_seeds(args.seed)
+    _configure_logging(args)
 
-    device = "GPU" if tf.config.list_physical_devices("GPU") else "CPU"
-    print(f"Using {device} for training.")
+    accelerator_type = "GPU" if tf.config.list_physical_devices("GPU") else "CPU"
+    print(f"Using {accelerator_type} for training.")
 
     Path("out-checkpoints/" + args.experiment_name + "/").mkdir(parents=True, exist_ok=True)
     Path("out-img/").mkdir(parents=True, exist_ok=True)
 
-    transform = GaussianNoise(args.gaussian_mean, args.gaussian_std)
-    train_set = CzechSLRDataset(args.training_set_path, transform=transform, augmentations=True)
+    transform = AdditiveGaussianNoise(args.gaussian_mean, args.gaussian_std)
+    training_dataset = CzechSignLanguageDataset(args.training_set_path, transform=transform, augmentations=True)
 
     if args.validation_set == "from-file":
-        val_set = CzechSLRDataset(args.validation_set_path)
+        validation_dataset = CzechSignLanguageDataset(args.validation_set_path)
     elif args.validation_set == "split-from-train":
-        train_set, val_set = __balance_val_split(train_set, args.validation_set_size or 0.2)
-        val_set.transform = None
-        val_set.augmentations = False
+        training_dataset, validation_dataset = stratified_train_validation_split(training_dataset, args.validation_set_size or 0.2)
+        validation_dataset.transform = None
+        validation_dataset.augmentations = False
     else:
-        val_set = None
+        validation_dataset = None
 
     if args.testing_set_path:
-        eval_set = CzechSLRDataset(args.testing_set_path)
+        test_dataset = CzechSignLanguageDataset(args.testing_set_path)
     else:
-        eval_set = None
+        test_dataset = None
 
     if args.experimental_train_split:
-        train_set = __split_of_train_sequence(train_set, args.experimental_train_split)
+        training_dataset = select_training_subset(training_dataset, args.experimental_train_split)
 
-    sample_shape = tuple(train_set[0][0].shape)
+    sample_shape = tuple(training_dataset[0][0].shape)
 
-    slrt_model = _build_model(args, sample_shape)
+    spoter_model = _initialize_model(args, sample_shape)
 
-    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+    loss_function = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
     optimizer = tf.keras.optimizers.SGD(learning_rate=args.lr)
-    scheduler = ReduceLROnPlateau(optimizer, factor=args.scheduler_factor, patience=args.scheduler_patience)
+    scheduler = PlateauLearningRateScheduler(optimizer, factor=args.scheduler_factor, patience=args.scheduler_patience)
 
     if not args.quantization_aware_training:
         dummy_input = tf.zeros((1,) + sample_shape, dtype=tf.float32)
-        slrt_model(dummy_input, training=False)
+        spoter_model(dummy_input, training=False)
 
-    train_acc, val_acc = 0, 0
-    losses, train_accs, val_accs = [], [], []
-    lr_progress = []
-    top_train_acc, top_val_acc = 0, 0
-    checkpoint_index = 0
+    training_accuracy, validation_accuracy = 0, 0
+    epoch_losses, training_accuracies, validation_accuracies = [], [], []
+    learning_rate_history = []
+    best_training_accuracy, best_validation_accuracy = 0, 0
+    checkpoint_rotation_index = 0
 
     if args.experimental_train_split:
         print("Starting " + args.experiment_name + "_" + str(args.experimental_train_split).replace(".", "") + "...\n\n")
@@ -165,77 +165,77 @@ def train(args):
         logging.info("Starting " + args.experiment_name + "...\n\n")
 
     for epoch in range(args.epochs):
-        train_loss, _, _, train_acc = train_epoch(slrt_model, train_set, loss_fn, optimizer, scheduler)
-        losses.append(train_loss / len(train_set))
-        train_accs.append(train_acc)
+        epoch_loss, _, _, training_accuracy = train_single_epoch(spoter_model, training_dataset, loss_function, optimizer, scheduler)
+        epoch_losses.append(epoch_loss / len(training_dataset))
+        training_accuracies.append(training_accuracy)
 
-        if val_set:
-            pred_correct, pred_all, val_acc = evaluate(slrt_model, val_set)
-            val_accs.append(val_acc)
+        if validation_dataset:
+            validation_correct, validation_total, validation_accuracy = evaluate_model(spoter_model, validation_dataset)
+            validation_accuracies.append(validation_accuracy)
 
         if args.save_checkpoints:
-            if train_acc > top_train_acc:
-                top_train_acc = train_acc
-                weights_path = f"out-checkpoints/{args.experiment_name}/checkpoint_t_{checkpoint_index}.ckpt"
-                slrt_model.save_weights(weights_path)
+            if training_accuracy > best_training_accuracy:
+                best_training_accuracy = training_accuracy
+                checkpoint_path = f"out-checkpoints/{args.experiment_name}/checkpoint_t_{checkpoint_rotation_index}.ckpt"
+                spoter_model.save_weights(checkpoint_path)
 
-            if val_set and val_acc > top_val_acc:
-                top_val_acc = val_acc
-                weights_path = f"out-checkpoints/{args.experiment_name}/checkpoint_v_{checkpoint_index}.ckpt"
-                slrt_model.save_weights(weights_path)
+            if validation_dataset and validation_accuracy > best_validation_accuracy:
+                best_validation_accuracy = validation_accuracy
+                checkpoint_path = f"out-checkpoints/{args.experiment_name}/checkpoint_v_{checkpoint_rotation_index}.ckpt"
+                spoter_model.save_weights(checkpoint_path)
 
         if epoch % args.log_freq == 0:
-            print("[" + str(epoch + 1) + "] TRAIN  loss: " + str(losses[-1]) + " acc: " + str(train_acc))
-            logging.info("[" + str(epoch + 1) + "] TRAIN  loss: " + str(losses[-1]) + " acc: " + str(train_acc))
+            print("[" + str(epoch + 1) + "] TRAIN  loss: " + str(epoch_losses[-1]) + " acc: " + str(training_accuracy))
+            logging.info("[" + str(epoch + 1) + "] TRAIN  loss: " + str(epoch_losses[-1]) + " acc: " + str(training_accuracy))
 
-            if val_set:
-                print("[" + str(epoch + 1) + "] VALIDATION  acc: " + str(val_acc))
-                logging.info("[" + str(epoch + 1) + "] VALIDATION  acc: " + str(val_acc))
+            if validation_dataset:
+                print("[" + str(epoch + 1) + "] VALIDATION  acc: " + str(validation_accuracy))
+                logging.info("[" + str(epoch + 1) + "] VALIDATION  acc: " + str(validation_accuracy))
 
             print("")
             logging.info("")
 
         if epoch % 10 == 0:
-            top_train_acc, top_val_acc = 0, 0
-            checkpoint_index += 1
+            best_training_accuracy, best_validation_accuracy = 0, 0
+            checkpoint_rotation_index += 1
 
-        lr_progress.append(float(tf.keras.backend.get_value(optimizer.learning_rate)))
+        learning_rate_history.append(float(tf.keras.backend.get_value(optimizer.learning_rate)))
 
     print("\nTesting checkpointed models starting...\n")
     logging.info("\nTesting checkpointed models starting...\n")
 
-    top_result, top_result_name = 0, ""
+    best_test_accuracy, best_checkpoint_name = 0, ""
 
-    if eval_set:
-        for i in range(checkpoint_index):
+    if test_dataset:
+        for i in range(checkpoint_rotation_index):
             for checkpoint_id in ["t", "v"]:
-                weights_path = f"out-checkpoints/{args.experiment_name}/checkpoint_{checkpoint_id}_{i}.ckpt"
-                if not os.path.exists(weights_path + ".index"):
+                checkpoint_path = f"out-checkpoints/{args.experiment_name}/checkpoint_{checkpoint_id}_{i}.ckpt"
+                if not os.path.exists(checkpoint_path + ".index"):
                     continue
 
-                tested_model = _build_model(args)
+                evaluation_model = _initialize_model(args)
                 dummy_input = tf.zeros((1,) + sample_shape, dtype=tf.float32)
-                tested_model(dummy_input, training=False)
-                tested_model.load_weights(weights_path)
-                _, _, eval_acc = evaluate(tested_model, eval_set, print_stats=True)
+                evaluation_model(dummy_input, training=False)
+                evaluation_model.load_weights(checkpoint_path)
+                _, _, test_accuracy = evaluate_model(evaluation_model, test_dataset, print_stats=True)
 
-                if eval_acc > top_result:
-                    top_result = eval_acc
-                    top_result_name = args.experiment_name + f"/checkpoint_{checkpoint_id}_{i}"
+                if test_accuracy > best_test_accuracy:
+                    best_test_accuracy = test_accuracy
+                    best_checkpoint_name = args.experiment_name + f"/checkpoint_{checkpoint_id}_{i}"
 
-                print(f"checkpoint_{checkpoint_id}_{i}  ->  {eval_acc}")
-                logging.info(f"checkpoint_{checkpoint_id}_{i}  ->  {eval_acc}")
+                print(f"checkpoint_{checkpoint_id}_{i}  ->  {test_accuracy}")
+                logging.info(f"checkpoint_{checkpoint_id}_{i}  ->  {test_accuracy}")
 
-        print("\nThe top result was recorded at " + str(top_result) + " testing accuracy. The best checkpoint is " + top_result_name + ".")
-        logging.info("\nThe top result was recorded at " + str(top_result) + " testing accuracy. The best checkpoint is " + top_result_name + ".")
+        print("\nThe top result was recorded at " + str(best_test_accuracy) + " testing accuracy. The best checkpoint is " + best_checkpoint_name + ".")
+        logging.info("\nThe top result was recorded at " + str(best_test_accuracy) + " testing accuracy. The best checkpoint is " + best_checkpoint_name + ".")
 
     if args.plot_stats:
         fig, ax = plt.subplots()
-        ax.plot(range(1, len(losses) + 1), losses, c="#D64436", label="Training loss")
-        ax.plot(range(1, len(train_accs) + 1), train_accs, c="#00B09B", label="Training accuracy")
+        ax.plot(range(1, len(epoch_losses) + 1), epoch_losses, c="#D64436", label="Training loss")
+        ax.plot(range(1, len(training_accuracies) + 1), training_accuracies, c="#00B09B", label="Training accuracy")
 
-        if val_set:
-            ax.plot(range(1, len(val_accs) + 1), val_accs, c="#E0A938", label="Validation accuracy")
+        if validation_dataset:
+            ax.plot(range(1, len(validation_accuracies) + 1), validation_accuracies, c="#E0A938", label="Validation accuracy")
 
         ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
         ax.set(xlabel="Epoch", ylabel="Accuracy / Loss", title="")
@@ -246,7 +246,7 @@ def train(args):
 
     if args.plot_lr:
         fig1, ax1 = plt.subplots()
-        ax1.plot(range(1, len(lr_progress) + 1), lr_progress, label="LR")
+        ax1.plot(range(1, len(learning_rate_history) + 1), learning_rate_history, label="LR")
         ax1.set(xlabel="Epoch", ylabel="LR", title="")
         ax1.grid()
 
@@ -257,6 +257,6 @@ def train(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser("", parents=[get_default_args()], add_help=False)
+    parser = argparse.ArgumentParser("", parents=[build_training_arg_parser()], add_help=False)
     args = parser.parse_args()
-    train(args)
+    run_training(args)

@@ -9,32 +9,32 @@ except ImportError:  # pragma: no cover - optional dependency
 
 
 @tf.keras.utils.register_keras_serializable(package="spoter")
-class _ScaledDotProductAttention(tf.keras.layers.Layer):
+class ScaledDotProductAttentionLayer(tf.keras.layers.Layer):
     """Scaled dot-product attention composed of quantizable primitives."""
 
     def __init__(self, dropout: float = 0.1, **kwargs):
         super().__init__(**kwargs)
-        self.dropout = tf.keras.layers.Dropout(dropout)
+        self.dropout_layer = tf.keras.layers.Dropout(dropout)
 
     def call(self, query: tf.Tensor, key: tf.Tensor, value: tf.Tensor,
              scale: float, attention_mask: Optional[tf.Tensor], training: bool) -> tf.Tensor:
-        scores = tf.matmul(query, key, transpose_b=True)
-        scores = scores * scale
+        attention_scores = tf.matmul(query, key, transpose_b=True)
+        attention_scores = attention_scores * scale
         if attention_mask is not None:
-            attention_mask = tf.cast(attention_mask, scores.dtype)
-            scores += attention_mask
-        weights = tf.nn.softmax(scores, axis=-1)
-        weights = self.dropout(weights, training=training)
-        return tf.matmul(weights, value)
+            attention_mask = tf.cast(attention_mask, attention_scores.dtype)
+            attention_scores += attention_mask
+        attention_weights = tf.nn.softmax(attention_scores, axis=-1)
+        attention_weights = self.dropout_layer(attention_weights, training=training)
+        return tf.matmul(attention_weights, value)
 
     def get_config(self):
         base_config = super().get_config()
-        base_config.update({"dropout": self.dropout.rate})
+        base_config.update({"dropout": self.dropout_layer.rate})
         return base_config
 
 
 @tf.keras.utils.register_keras_serializable(package="spoter")
-class QuantizableMultiHeadAttention(tf.keras.layers.Layer):
+class QuantizationReadyMultiHeadAttention(tf.keras.layers.Layer):
     """
     Custom multi-head attention that uses tf.keras primitives supported by
     TensorFlow Lite quantization aware training.
@@ -52,39 +52,45 @@ class QuantizableMultiHeadAttention(tf.keras.layers.Layer):
 
         if tfmot is not None:
             annotate = tfmot.quantization.keras.quantize_annotate_layer
-            self.query_dense = annotate(tf.keras.layers.Dense(num_heads * key_dim, use_bias=True, name="q"))
-            self.key_dense = annotate(tf.keras.layers.Dense(num_heads * key_dim, use_bias=True, name="k"))
-            self.value_dense = annotate(tf.keras.layers.Dense(num_heads * key_dim, use_bias=True, name="v"))
-            self.out_dense = annotate(tf.keras.layers.Dense(num_heads * key_dim, use_bias=True, name="out"))
+            self.query_dense = annotate(tf.keras.layers.Dense(num_heads * key_dim, use_bias=True, name="query_projection"))
+            self.key_dense = annotate(tf.keras.layers.Dense(num_heads * key_dim, use_bias=True, name="key_projection"))
+            self.value_dense = annotate(tf.keras.layers.Dense(num_heads * key_dim, use_bias=True, name="value_projection"))
+            self.out_dense = annotate(tf.keras.layers.Dense(num_heads * key_dim, use_bias=True, name="output_projection"))
         else:
-            self.query_dense = tf.keras.layers.Dense(num_heads * key_dim, use_bias=True, name="q")
-            self.key_dense = tf.keras.layers.Dense(num_heads * key_dim, use_bias=True, name="k")
-            self.value_dense = tf.keras.layers.Dense(num_heads * key_dim, use_bias=True, name="v")
-            self.out_dense = tf.keras.layers.Dense(num_heads * key_dim, use_bias=True, name="out")
-        self.attention = _ScaledDotProductAttention(dropout)
+            self.query_dense = tf.keras.layers.Dense(num_heads * key_dim, use_bias=True, name="query_projection")
+            self.key_dense = tf.keras.layers.Dense(num_heads * key_dim, use_bias=True, name="key_projection")
+            self.value_dense = tf.keras.layers.Dense(num_heads * key_dim, use_bias=True, name="value_projection")
+            self.out_dense = tf.keras.layers.Dense(num_heads * key_dim, use_bias=True, name="output_projection")
+        self.attention_layer = ScaledDotProductAttentionLayer(dropout)
 
-    def _split_heads(self, tensor: tf.Tensor) -> tf.Tensor:
-        batch_size = tf.shape(tensor)[0]
-        seq_len = tf.shape(tensor)[1]
-        new_shape = (batch_size, seq_len, self.num_heads, self.key_dim)
-        tensor = tf.reshape(tensor, new_shape)
-        return tf.transpose(tensor, perm=(0, 2, 1, 3))
+    def _split_heads(self, projection: tf.Tensor) -> tf.Tensor:
+        batch_size = tf.shape(projection)[0]
+        sequence_length = tf.shape(projection)[1]
+        reshaped = tf.reshape(projection, (batch_size, sequence_length, self.num_heads, self.key_dim))
+        return tf.transpose(reshaped, perm=(0, 2, 1, 3))
 
-    def _combine_heads(self, tensor: tf.Tensor) -> tf.Tensor:
-        tensor = tf.transpose(tensor, perm=(0, 2, 1, 3))
-        batch_size = tf.shape(tensor)[0]
-        seq_len = tf.shape(tensor)[1]
-        return tf.reshape(tensor, (batch_size, seq_len, self.num_heads * self.key_dim))
+    def _combine_heads(self, attention_output: tf.Tensor) -> tf.Tensor:
+        attention_output = tf.transpose(attention_output, perm=(0, 2, 1, 3))
+        batch_size = tf.shape(attention_output)[0]
+        sequence_length = tf.shape(attention_output)[1]
+        return tf.reshape(attention_output, (batch_size, sequence_length, self.num_heads * self.key_dim))
 
     def call(self, query: tf.Tensor, value: tf.Tensor, key: tf.Tensor,
              attention_mask: Optional[tf.Tensor] = None, training: bool = False) -> tf.Tensor:
-        q = self._split_heads(self.query_dense(query))
-        k = self._split_heads(self.key_dense(key))
-        v = self._split_heads(self.value_dense(value))
+        query_projection = self._split_heads(self.query_dense(query))
+        key_projection = self._split_heads(self.key_dense(key))
+        value_projection = self._split_heads(self.value_dense(value))
 
-        attn = self.attention(q, k, v, self.scale, attention_mask, training)
-        attn = self._combine_heads(attn)
-        return self.out_dense(attn)
+        attention_output = self.attention_layer(
+            query_projection,
+            key_projection,
+            value_projection,
+            self.scale,
+            attention_mask,
+            training,
+        )
+        attention_output = self._combine_heads(attention_output)
+        return self.out_dense(attention_output)
 
     def get_config(self):
         base_config = super().get_config()
@@ -97,7 +103,7 @@ class QuantizableMultiHeadAttention(tf.keras.layers.Layer):
 
 
 @tf.keras.utils.register_keras_serializable(package="spoter")
-class TransformerEncoderLayer(tf.keras.layers.Layer):
+class SpoterEncoderLayer(tf.keras.layers.Layer):
     def __init__(self, d_model: int, num_heads: int, dim_feedforward: int = 2048,
                  dropout: float = 0.1, activation: str = "relu", **kwargs):
         super().__init__(**kwargs)
@@ -109,27 +115,32 @@ class TransformerEncoderLayer(tf.keras.layers.Layer):
         self.dropout_rate = dropout
         self.activation_name = activation
 
-        self.self_attn = QuantizableMultiHeadAttention(num_heads=num_heads, key_dim=d_model // num_heads,
-                                                       dropout=dropout)
-        self.dropout1 = tf.keras.layers.Dropout(dropout)
-        self.norm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.self_attention = QuantizationReadyMultiHeadAttention(num_heads=num_heads, key_dim=d_model // num_heads,
+                                                                  dropout=dropout)
+        self.dropout_after_attention = tf.keras.layers.Dropout(dropout)
+        self.layer_norm_after_attention = tf.keras.layers.LayerNormalization(epsilon=1e-6)
 
-        self.linear1 = tf.keras.layers.Dense(dim_feedforward, activation=tf.keras.activations.get(activation))
-        self.dropout_ff = tf.keras.layers.Dropout(dropout)
-        self.linear2 = tf.keras.layers.Dense(d_model)
-        self.dropout2 = tf.keras.layers.Dropout(dropout)
-        self.norm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.feedforward_projection = tf.keras.layers.Dense(dim_feedforward, activation=tf.keras.activations.get(activation))
+        self.feedforward_dropout = tf.keras.layers.Dropout(dropout)
+        self.feedforward_output_projection = tf.keras.layers.Dense(d_model)
+        self.dropout_after_feedforward = tf.keras.layers.Dropout(dropout)
+        self.layer_norm_after_feedforward = tf.keras.layers.LayerNormalization(epsilon=1e-6)
 
-    def call(self, src: tf.Tensor, training: bool = False,
+    def call(self, encoder_input: tf.Tensor, training: bool = False,
              mask: Optional[tf.Tensor] = None) -> tf.Tensor:
-        attn_output = self.self_attn(src, src, src, attention_mask=mask, training=training)
-        src = self.norm1(src + self.dropout1(attn_output, training=training))
+        attention_output = self.self_attention(encoder_input, encoder_input, encoder_input,
+                                               attention_mask=mask, training=training)
+        encoder_input = self.layer_norm_after_attention(
+            encoder_input + self.dropout_after_attention(attention_output, training=training)
+        )
 
-        ff_output = self.linear1(src)
-        ff_output = self.dropout_ff(ff_output, training=training)
-        ff_output = self.linear2(ff_output)
-        src = self.norm2(src + self.dropout2(ff_output, training=training))
-        return src
+        feedforward_output = self.feedforward_projection(encoder_input)
+        feedforward_output = self.feedforward_dropout(feedforward_output, training=training)
+        feedforward_output = self.feedforward_output_projection(feedforward_output)
+        encoder_input = self.layer_norm_after_feedforward(
+            encoder_input + self.dropout_after_feedforward(feedforward_output, training=training)
+        )
+        return encoder_input
 
     def get_config(self):
         config = super().get_config()
@@ -144,7 +155,7 @@ class TransformerEncoderLayer(tf.keras.layers.Layer):
 
 
 @tf.keras.utils.register_keras_serializable(package="spoter")
-class TransformerDecoderLayer(tf.keras.layers.Layer):
+class SpoterDecoderLayer(tf.keras.layers.Layer):
     def __init__(self, d_model: int, num_heads: int, dim_feedforward: int = 2048,
                  dropout: float = 0.1, activation: str = "relu", **kwargs):
         super().__init__(**kwargs)
@@ -159,28 +170,32 @@ class TransformerDecoderLayer(tf.keras.layers.Layer):
         self.initial_dropout = tf.keras.layers.Dropout(dropout)
         self.initial_norm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
 
-        self.cross_attn = QuantizableMultiHeadAttention(num_heads=num_heads, key_dim=d_model // num_heads,
-                                                        dropout=dropout)
-        self.dropout1 = tf.keras.layers.Dropout(dropout)
-        self.norm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.cross_attention = QuantizationReadyMultiHeadAttention(num_heads=num_heads, key_dim=d_model // num_heads,
+                                                                   dropout=dropout)
+        self.dropout_after_cross_attention = tf.keras.layers.Dropout(dropout)
+        self.layer_norm_after_cross_attention = tf.keras.layers.LayerNormalization(epsilon=1e-6)
 
-        self.linear1 = tf.keras.layers.Dense(dim_feedforward, activation=tf.keras.activations.get(activation))
-        self.dropout_ff = tf.keras.layers.Dropout(dropout)
-        self.linear2 = tf.keras.layers.Dense(d_model)
-        self.dropout2 = tf.keras.layers.Dropout(dropout)
-        self.norm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.feedforward_projection = tf.keras.layers.Dense(dim_feedforward, activation=tf.keras.activations.get(activation))
+        self.feedforward_dropout = tf.keras.layers.Dropout(dropout)
+        self.feedforward_output_projection = tf.keras.layers.Dense(d_model)
+        self.dropout_after_feedforward = tf.keras.layers.Dropout(dropout)
+        self.layer_norm_after_feedforward = tf.keras.layers.LayerNormalization(epsilon=1e-6)
 
-    def call(self, tgt: tf.Tensor, memory: tf.Tensor, training: bool = False,
+    def call(self, decoder_query: tf.Tensor, memory: tf.Tensor, training: bool = False,
              memory_mask: Optional[tf.Tensor] = None) -> tf.Tensor:
-        tgt = self.initial_norm(tgt + self.initial_dropout(tgt, training=training))
-        attn_output = self.cross_attn(tgt, memory, memory, attention_mask=memory_mask, training=training)
-        tgt = self.norm1(tgt + self.dropout1(attn_output, training=training))
+        decoder_query = self.initial_norm(decoder_query + self.initial_dropout(decoder_query, training=training))
+        attention_output = self.cross_attention(decoder_query, memory, memory, attention_mask=memory_mask, training=training)
+        decoder_query = self.layer_norm_after_cross_attention(
+            decoder_query + self.dropout_after_cross_attention(attention_output, training=training)
+        )
 
-        ff_output = self.linear1(tgt)
-        ff_output = self.dropout_ff(ff_output, training=training)
-        ff_output = self.linear2(ff_output)
-        tgt = self.norm2(tgt + self.dropout2(ff_output, training=training))
-        return tgt
+        feedforward_output = self.feedforward_projection(decoder_query)
+        feedforward_output = self.feedforward_dropout(feedforward_output, training=training)
+        feedforward_output = self.feedforward_output_projection(feedforward_output)
+        decoder_query = self.layer_norm_after_feedforward(
+            decoder_query + self.dropout_after_feedforward(feedforward_output, training=training)
+        )
+        return decoder_query
 
     def get_config(self):
         config = super().get_config()
@@ -195,7 +210,7 @@ class TransformerDecoderLayer(tf.keras.layers.Layer):
 
 
 @tf.keras.utils.register_keras_serializable(package="spoter")
-class TransformerEncoder(tf.keras.layers.Layer):
+class SpoterEncoderStack(tf.keras.layers.Layer):
     def __init__(self, num_layers: int, d_model: int, num_heads: int,
                  dim_feedforward: int = 2048, dropout: float = 0.1,
                  activation: str = "relu", **kwargs):
@@ -204,16 +219,16 @@ class TransformerEncoder(tf.keras.layers.Layer):
         self.d_model = d_model
         self.num_heads = num_heads
         self.dim_feedforward = dim_feedforward
-        self.dropout = dropout
-        self.activation = activation
+        self.dropout_rate = dropout
+        self.activation_name = activation
 
         self.layers = [
-            TransformerEncoderLayer(d_model, num_heads, dim_feedforward, dropout, activation)
+            SpoterEncoderLayer(d_model, num_heads, dim_feedforward, dropout, activation)
             for _ in range(num_layers)
         ]
 
-    def call(self, src: tf.Tensor, training: bool = False) -> tf.Tensor:
-        output = src
+    def call(self, encoder_input: tf.Tensor, training: bool = False) -> tf.Tensor:
+        output = encoder_input
         for layer in self.layers:
             output = layer(output, training=training)
         return output
@@ -225,14 +240,14 @@ class TransformerEncoder(tf.keras.layers.Layer):
             "d_model": self.d_model,
             "num_heads": self.num_heads,
             "dim_feedforward": self.dim_feedforward,
-            "dropout": self.dropout,
-            "activation": self.activation,
+            "dropout": self.dropout_rate,
+            "activation": self.activation_name,
         })
         return config
 
 
 @tf.keras.utils.register_keras_serializable(package="spoter")
-class TransformerDecoder(tf.keras.layers.Layer):
+class SpoterDecoderStack(tf.keras.layers.Layer):
     def __init__(self, num_layers: int, d_model: int, num_heads: int,
                  dim_feedforward: int = 2048, dropout: float = 0.1,
                  activation: str = "relu", **kwargs):
@@ -241,16 +256,16 @@ class TransformerDecoder(tf.keras.layers.Layer):
         self.d_model = d_model
         self.num_heads = num_heads
         self.dim_feedforward = dim_feedforward
-        self.dropout = dropout
-        self.activation = activation
+        self.dropout_rate = dropout
+        self.activation_name = activation
 
         self.layers = [
-            TransformerDecoderLayer(d_model, num_heads, dim_feedforward, dropout, activation)
+            SpoterDecoderLayer(d_model, num_heads, dim_feedforward, dropout, activation)
             for _ in range(num_layers)
         ]
 
-    def call(self, tgt: tf.Tensor, memory: tf.Tensor, training: bool = False) -> tf.Tensor:
-        output = tgt
+    def call(self, decoder_query: tf.Tensor, memory: tf.Tensor, training: bool = False) -> tf.Tensor:
+        output = decoder_query
         for layer in self.layers:
             output = layer(output, memory, training=training)
         return output
@@ -262,8 +277,8 @@ class TransformerDecoder(tf.keras.layers.Layer):
             "d_model": self.d_model,
             "num_heads": self.num_heads,
             "dim_feedforward": self.dim_feedforward,
-            "dropout": self.dropout,
-            "activation": self.activation,
+            "dropout": self.dropout_rate,
+            "activation": self.activation_name,
         })
         return config
 
@@ -285,23 +300,23 @@ class SPOTER(tf.keras.Model):
         self.num_encoder_layers = num_encoder_layers
         self.num_decoder_layers = num_decoder_layers
         self.dim_feedforward = dim_feedforward
-        self.dropout = dropout
-        self.activation = activation
+        self.dropout_rate = dropout
+        self.activation_name = activation
 
-        self.pos = self.add_weight(
+        self.positional_embedding = self.add_weight(
             name="positional_embedding",
             shape=(1, 1, hidden_dim),
             initializer=tf.keras.initializers.RandomUniform(),
             trainable=True,
         )
-        self.class_query = self.add_weight(
+        self.classification_token = self.add_weight(
             name="class_query",
             shape=(1, hidden_dim),
             initializer=tf.keras.initializers.RandomUniform(),
             trainable=True,
         )
 
-        self.encoder = TransformerEncoder(
+        self.encoder = SpoterEncoderStack(
             num_layers=num_encoder_layers,
             d_model=hidden_dim,
             num_heads=num_heads,
@@ -309,7 +324,7 @@ class SPOTER(tf.keras.Model):
             dropout=dropout,
             activation=activation,
         )
-        self.decoder = TransformerDecoder(
+        self.decoder = SpoterDecoderStack(
             num_layers=num_decoder_layers,
             d_model=hidden_dim,
             num_heads=num_heads,
@@ -322,24 +337,24 @@ class SPOTER(tf.keras.Model):
     def call(self, inputs: tf.Tensor, training: bool = False) -> tf.Tensor:
         inputs = tf.cast(inputs, tf.float32)
         batch_size = tf.shape(inputs)[0]
-        flattened = tf.reshape(inputs, (batch_size, 1, -1))
+        flattened_inputs = tf.reshape(inputs, (batch_size, 1, -1))
 
-        hidden_dim = tf.shape(flattened)[-1]
+        hidden_dim = tf.shape(flattened_inputs)[-1]
         expected_dim = tf.constant(self.hidden_dim, dtype=hidden_dim.dtype)
         with tf.control_dependencies([
             tf.debugging.assert_equal(hidden_dim, expected_dim,
                                       message="Flattened input dimension must equal hidden_dim."),
         ]):
-            encoder_input = tf.reshape(flattened, (batch_size, 1, self.hidden_dim))
+            encoder_input = tf.reshape(flattened_inputs, (batch_size, 1, self.hidden_dim))
 
-        positional = tf.broadcast_to(self.pos, (batch_size, 1, self.hidden_dim))
-        memory = self.encoder(encoder_input + positional, training=training)
+        positional_encoding = tf.broadcast_to(self.positional_embedding, (batch_size, 1, self.hidden_dim))
+        encoder_memory = self.encoder(encoder_input + positional_encoding, training=training)
 
-        class_query = tf.broadcast_to(self.class_query, (batch_size, self.hidden_dim))
-        class_query = tf.expand_dims(class_query, axis=1)
-        decoder_output = self.decoder(class_query, memory, training=training)
-        logits = self.classifier(decoder_output)
-        return logits
+        class_token = tf.broadcast_to(self.classification_token, (batch_size, self.hidden_dim))
+        class_token = tf.expand_dims(class_token, axis=1)
+        decoder_output = self.decoder(class_token, encoder_memory, training=training)
+        class_logits = self.classifier(decoder_output)
+        return class_logits
 
     def get_config(self):
         config = super().get_config()
@@ -350,8 +365,8 @@ class SPOTER(tf.keras.Model):
             "num_encoder_layers": self.num_encoder_layers,
             "num_decoder_layers": self.num_decoder_layers,
             "dim_feedforward": self.dim_feedforward,
-            "dropout": self.dropout,
-            "activation": self.activation,
+            "dropout": self.dropout_rate,
+            "activation": self.activation_name,
         })
         return config
 
@@ -367,11 +382,11 @@ def create_quantization_aware_spoter(example_input_shape, **model_kwargs) -> tf.
 
     annotated_model = tfmot.quantization.keras.quantize_annotate_model(base_model)
     with tfmot.quantization.keras.quantize_scope({
-        "QuantizableMultiHeadAttention": QuantizableMultiHeadAttention,
-        "TransformerEncoderLayer": TransformerEncoderLayer,
-        "TransformerDecoderLayer": TransformerDecoderLayer,
-        "TransformerEncoder": TransformerEncoder,
-        "TransformerDecoder": TransformerDecoder,
+        "QuantizationReadyMultiHeadAttention": QuantizationReadyMultiHeadAttention,
+        "SpoterEncoderLayer": SpoterEncoderLayer,
+        "SpoterDecoderLayer": SpoterDecoderLayer,
+        "SpoterEncoderStack": SpoterEncoderStack,
+        "SpoterDecoderStack": SpoterDecoderStack,
         "SPOTER": SPOTER,
     }):
         qat_model = tfmot.quantization.keras.quantize_apply(annotated_model)
