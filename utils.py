@@ -1,41 +1,43 @@
-
-import numpy as np
+"""Dataset splitting helpers shared across training scripts."""
 
 from collections import Counter
-from torch.utils.data import Subset
+from typing import Tuple
+
+import numpy as np
 from sklearn.model_selection import train_test_split
 
 
-def __balance_val_split(dataset, val_split=0.):
+def stratified_train_validation_split(dataset, validation_ratio: float = 0.0):
     targets = np.array(dataset.targets)
-    train_indices, val_indices = train_test_split(
+    train_indices, validation_indices = train_test_split(
         np.arange(targets.shape[0]),
-        test_size=val_split,
-        stratify=targets
+        test_size=validation_ratio,
+        stratify=targets,
     )
 
-    train_dataset = Subset(dataset, indices=train_indices)
-    val_dataset = Subset(dataset, indices=val_indices)
+    training_dataset = dataset.subset(train_indices)
+    validation_dataset = dataset.subset(validation_indices)
 
-    return train_dataset, val_dataset
+    return training_dataset, validation_dataset
 
 
-def __split_of_train_sequence(subset: Subset, train_split=1.0):
-    if train_split == 1:
-        return subset
+def select_training_subset(dataset, train_fraction: float = 1.0):
+    if train_fraction == 1:
+        return dataset
 
-    targets = np.array([subset.dataset.targets[i] for i in subset.indices])
+    targets = np.array(dataset.targets)
     train_indices, _ = train_test_split(
         np.arange(targets.shape[0]),
-        test_size=1 - train_split,
-        stratify=targets
+        test_size=1 - train_fraction,
+        stratify=targets,
     )
 
-    train_dataset = Subset(subset.dataset, indices=[subset.indices[i] for i in train_indices])
+    training_dataset = dataset.subset(train_indices)
 
-    return train_dataset
+    return training_dataset
 
 
-def __log_class_statistics(subset: Subset):
-    train_classes = [subset.dataset.targets[i] for i in subset.indices]
-    print(dict(Counter(train_classes)))
+def log_class_distribution(dataset) -> Tuple[int, int]:
+    class_counts = dict(Counter(dataset.targets))
+    print(class_counts)
+    return len(class_counts), sum(class_counts.values())

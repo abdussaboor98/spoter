@@ -1,20 +1,22 @@
 import ast
-import torch
-
-import pandas as pd
-import torch.utils.data as torch_data
-
+import random
 from random import randrange
+from typing import Callable, List, Optional, Sequence
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+
 from augmentations import *
 from normalization.body_normalization import BODY_IDENTIFIERS
 from normalization.hand_normalization import HAND_IDENTIFIERS
 from normalization.body_normalization import normalize_single_dict as normalize_single_body_dict
 from normalization.hand_normalization import normalize_single_dict as normalize_single_hand_dict
 
-HAND_IDENTIFIERS = [id + "_0" for id in HAND_IDENTIFIERS] + [id + "_1" for id in HAND_IDENTIFIERS]
+HAND_IDENTIFIERS = [identifier + "_0" for identifier in HAND_IDENTIFIERS] + [identifier + "_1" for identifier in HAND_IDENTIFIERS]
 
 
-def load_dataset(file_location: str):
+def load_pose_sequences(file_location: str):
 
     # Load the datset csv file
     df = pd.read_csv(file_location, encoding="utf-8")
@@ -28,50 +30,68 @@ def load_dataset(file_location: str):
     # TEMP
     labels = df["labels"].to_list()
     # labels = [label + 1 for label in df["labels"].to_list()]
-    data = []
+    pose_sequences = []
 
     for row_index, row in df.iterrows():
-        current_row = np.empty(shape=(len(ast.literal_eval(row["leftEar_X"])), len(BODY_IDENTIFIERS + HAND_IDENTIFIERS), 2))
+        sequence_frames = np.empty(
+            shape=(len(ast.literal_eval(row["leftEar_X"])), len(BODY_IDENTIFIERS + HAND_IDENTIFIERS), 2),
+            dtype=np.float32,
+        )
         for index, identifier in enumerate(BODY_IDENTIFIERS + HAND_IDENTIFIERS):
-            current_row[:, index, 0] = ast.literal_eval(row[identifier + "_X"])
-            current_row[:, index, 1] = ast.literal_eval(row[identifier + "_Y"])
+            sequence_frames[:, index, 0] = ast.literal_eval(row[identifier + "_X"])
+            sequence_frames[:, index, 1] = ast.literal_eval(row[identifier + "_Y"])
 
-        data.append(current_row)
+        pose_sequences.append(sequence_frames)
 
-    return data, labels
-
-
-def tensor_to_dictionary(landmarks_tensor: torch.Tensor) -> dict:
-
-    data_array = landmarks_tensor.numpy()
-    output = {}
-
-    for landmark_index, identifier in enumerate(BODY_IDENTIFIERS + HAND_IDENTIFIERS):
-        output[identifier] = data_array[:, landmark_index]
-
-    return output
+    return pose_sequences, labels
 
 
-def dictionary_to_tensor(landmarks_dict: dict) -> torch.Tensor:
+def pose_tensor_to_dict(landmarks_array: np.ndarray) -> dict:
 
-    output = np.empty(shape=(len(landmarks_dict["leftEar"]), len(BODY_IDENTIFIERS + HAND_IDENTIFIERS), 2))
+    data_array = np.asarray(landmarks_array)
+    landmark_dictionary = {}
 
     for landmark_index, identifier in enumerate(BODY_IDENTIFIERS + HAND_IDENTIFIERS):
-        output[:, landmark_index, 0] = [frame[0] for frame in landmarks_dict[identifier]]
-        output[:, landmark_index, 1] = [frame[1] for frame in landmarks_dict[identifier]]
+        landmark_dictionary[identifier] = [
+            (float(frame[0]), float(frame[1])) for frame in data_array[:, landmark_index]
+        ]
 
-    return torch.from_numpy(output)
+    return landmark_dictionary
 
 
-class CzechSLRDataset(torch_data.Dataset):
+def pose_dict_to_tensor(landmarks_dict: dict) -> tf.Tensor:
+
+    sequence_length = len(landmarks_dict["leftEar"])
+    pose_tensor = np.empty(
+        shape=(sequence_length, len(BODY_IDENTIFIERS + HAND_IDENTIFIERS), 2), dtype=np.float32
+    )
+
+    for landmark_index, identifier in enumerate(BODY_IDENTIFIERS + HAND_IDENTIFIERS):
+        pose_tensor[:, landmark_index, 0] = [frame[0] for frame in landmarks_dict[identifier]]
+        pose_tensor[:, landmark_index, 1] = [frame[1] for frame in landmarks_dict[identifier]]
+
+    return tf.convert_to_tensor(pose_tensor, dtype=tf.float32)
+
+
+class CzechSignLanguageDataset:
     """Advanced object representation of the HPOES dataset for loading hand joints landmarks utilizing the Torch's
     built-in Dataset properties"""
 
-    data: [np.ndarray]
-    labels: [np.ndarray]
+    data: List[np.ndarray]
+    labels: List[int]
 
-    def __init__(self, dataset_filename: str, num_labels=5, transform=None, augmentations=False,
-                 augmentations_prob=0.5, normalize=True):
+    def __init__(
+            self,
+            dataset_filename: Optional[str] = None,
+            num_labels: int = 5,
+            transform: Optional[Callable[[tf.Tensor], tf.Tensor]] = None,
+            augmentations: bool = False,
+            augmentations_prob: float = 0.5,
+            normalize: bool = True,
+            data: Optional[Sequence[np.ndarray]] = None,
+            labels: Optional[Sequence[int]] = None,
+            indices: Optional[Sequence[int]] = None,
+    ):
         """
         Initiates the HPOESDataset with the pre-loaded data from the h5 file.
 
@@ -79,12 +99,23 @@ class CzechSLRDataset(torch_data.Dataset):
         :param transform: Any data transformation to be applied (default: None)
         """
 
-        loaded_data = load_dataset(dataset_filename)
-        data, labels = loaded_data[0], loaded_data[1]
+        if data is not None and labels is not None:
+            self._base_pose_sequences = list(data)
+            self._base_labels = list(labels)
+        elif dataset_filename is not None:
+            loaded_data = load_pose_sequences(dataset_filename)
+            self._base_pose_sequences, self._base_labels = list(loaded_data[0]), list(loaded_data[1])
+        else:
+            raise ValueError("Either dataset_filename or data/labels must be provided.")
 
-        self.data = data
-        self.labels = labels
-        self.targets = list(labels)
+        if indices is None:
+            self.indices = list(range(len(self._base_pose_sequences)))
+        else:
+            self.indices = list(indices)
+
+        self.pose_sequences = self._base_pose_sequences
+        self.labels = self._base_labels
+        self.targets = [self._base_labels[i] for i in self.indices]
         self.num_labels = num_labels
         self.transform = transform
 
@@ -92,52 +123,64 @@ class CzechSLRDataset(torch_data.Dataset):
         self.augmentations_prob = augmentations_prob
         self.normalize = normalize
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         """
         Allocates, potentially transforms and returns the item at the desired index.
 
         :param idx: Index of the item
-        :return: Tuple containing both the depth map and the label
+        :return: Tuple containing both the pose sequence tensor and the label
         """
 
-        depth_map = torch.from_numpy(np.copy(self.data[idx]))
-        label = torch.Tensor([self.labels[idx] - 1])
-
-        depth_map = tensor_to_dictionary(depth_map)
+        base_index = self.indices[idx]
+        pose_sequence = np.copy(self.pose_sequences[base_index])
+        label = tf.convert_to_tensor(self.labels[base_index] - 1, dtype=tf.int32)
+        pose_sequence = pose_tensor_to_dict(pose_sequence)
 
         # Apply potential augmentations
         if self.augmentations and random.random() < self.augmentations_prob:
 
-            selected_aug = randrange(4)
+            selected_augmentation = randrange(4)
 
-            if selected_aug == 0:
-                depth_map = augment_rotate(depth_map, (-13, 13))
+            if selected_augmentation == 0:
+                pose_sequence = augment_rotate(pose_sequence, (-13, 13))
 
-            if selected_aug == 1:
-                depth_map = augment_shear(depth_map, "perspective", (0, 0.1))
+            if selected_augmentation == 1:
+                pose_sequence = augment_shear(pose_sequence, "perspective", (0, 0.1))
 
-            if selected_aug == 2:
-                depth_map = augment_shear(depth_map, "squeeze", (0, 0.15))
+            if selected_augmentation == 2:
+                pose_sequence = augment_shear(pose_sequence, "squeeze", (0, 0.15))
 
-            if selected_aug == 3:
-                depth_map = augment_arm_joint_rotate(depth_map, 0.3, (-4, 4))
+            if selected_augmentation == 3:
+                pose_sequence = augment_arm_joint_rotate(pose_sequence, 0.3, (-4, 4))
 
         if self.normalize:
-            depth_map = normalize_single_body_dict(depth_map)
-            depth_map = normalize_single_hand_dict(depth_map)
+            pose_sequence = normalize_single_body_dict(pose_sequence)
+            pose_sequence = normalize_single_hand_dict(pose_sequence)
 
-        depth_map = dictionary_to_tensor(depth_map)
+        pose_sequence = pose_dict_to_tensor(pose_sequence)
 
         # Move the landmark position interval to improve performance
-        depth_map = depth_map - 0.5
+        pose_sequence = pose_sequence - 0.5
 
         if self.transform:
-            depth_map = self.transform(depth_map)
+            pose_sequence = self.transform(pose_sequence)
 
-        return depth_map, label
+        return pose_sequence, label
 
     def __len__(self):
-        return len(self.labels)
+        return len(self.indices)
+
+    def subset(self, subset_indices: Sequence[int]):
+        return CzechSignLanguageDataset(
+            num_labels=self.num_labels,
+            transform=self.transform,
+            augmentations=self.augmentations,
+            augmentations_prob=self.augmentations_prob,
+            normalize=self.normalize,
+            data=self._base_pose_sequences,
+            labels=self._base_labels,
+            indices=[self.indices[i] for i in subset_indices],
+        )
 
 
 if __name__ == "__main__":
