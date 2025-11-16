@@ -257,6 +257,7 @@ def run_training(args):
     sample_shape = training_dataset.input_shape
 
     spoter_model = _initialize_model(args, sample_shape)
+    spoter_model.summary()
 
     loss_function = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
     optimizer = _build_optimizer(args)
@@ -452,6 +453,7 @@ def run_training(args):
             if export_dir.exists():
                 shutil.rmtree(export_dir)
             tf.saved_model.save(evaluation_model, export_dir)
+            evaluation_model.summary()
         
 
         summary_message = "\nThe top result was recorded at " + str(best_test_accuracy) + " testing accuracy. The best checkpoint is " + best_checkpoint_name + "."
