@@ -68,10 +68,10 @@ def train_single_epoch(model: tf.keras.Model, dataset: tf.data.Dataset, loss_fn,
         progress_iterator = batch_bar
 
     for batch_inputs, batch_labels in progress_iterator:
-        mask = batch_inputs["mask"]
+        mask = batch_inputs.get("mask")
         features = batch_inputs["pose"]
         with tf.GradientTape() as tape:
-            logits = model(features, training=True, attention_mask=mask)
+            logits = model(features, training=True, mask=mask)
             logits = tf.squeeze(logits, axis=1)
             loss = loss_fn(batch_labels, logits)
 
@@ -112,9 +112,9 @@ def evaluate_model(model: tf.keras.Model, dataset: tf.data.Dataset, num_classes:
     class_level_total = np.zeros(num_classes, dtype=np.int32)
 
     for batch_inputs, batch_labels in dataset:
-        mask = batch_inputs["mask"]
+        mask = batch_inputs.get("mask")
         features = batch_inputs["pose"]
-        logits = model(features, training=False, attention_mask=mask)
+        logits = model(features, training=False, mask=mask)
         logits = tf.squeeze(logits, axis=1)
         predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
 
@@ -148,9 +148,9 @@ def evaluate_top_k_accuracy(model: tf.keras.Model, dataset: tf.data.Dataset, k: 
     correct_predictions, total_predictions = 0, 0
 
     for batch_inputs, batch_labels in dataset:
-        mask = batch_inputs["mask"]
+        mask = batch_inputs.get("mask")
         features = batch_inputs["pose"]
-        logits = model(features, training=False, attention_mask=mask)
+        logits = model(features, training=False, mask=mask)
         logits = tf.squeeze(logits, axis=1)
         top_k_results = tf.math.top_k(logits, k=k)
 

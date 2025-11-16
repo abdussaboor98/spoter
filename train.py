@@ -16,6 +16,14 @@ from datasets.sign_pose_dataset import SignPoseDataset
 from spoter.spoter_model import SPOTER
 from spoter.utils import train_single_epoch, evaluate_model, PlateauLearningRateScheduler
 from spoter.gaussian_noise import AdditiveGaussianNoise
+from spoter.config import DEFAULT_TCN_CHANNELS, parse_tcn_channels, resolve_tcn_channels
+
+
+def _tcn_channels_argument(value: str):
+    try:
+        return parse_tcn_channels(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def build_training_arg_parser():
@@ -24,10 +32,38 @@ def build_training_arg_parser():
     parser.add_argument("--experiment_name", type=str, default="lsa_64_spoter",
                         help="Name of the experiment after which the logs and plots will be named")
     parser.add_argument("--num_classes", type=int, default=10, help="Number of classes to be recognized by the model")
-    parser.add_argument("--hidden_dim", type=int, default=108,
-                        help="Hidden dimension of the underlying Transformer model")
     parser.add_argument("--seed", type=int, default=379,
                         help="Seed with which to initialize all the random components of the training")
+    parser.add_argument(
+        "--tcn_channels",
+        type=_tcn_channels_argument,
+        default=None,
+        help=f"Comma-separated TemporalConvBlock widths (default: {','.join(map(str, DEFAULT_TCN_CHANNELS))}).",
+    )
+    parser.add_argument(
+        "--tcn_kernel_size",
+        type=int,
+        default=5,
+        help="Kernel size used for every TemporalConvBlock convolution.",
+    )
+    parser.add_argument(
+        "--tcn_dropout",
+        type=float,
+        default=0.1,
+        help="Dropout rate applied inside each TemporalConvBlock.",
+    )
+    parser.add_argument(
+        "--tcn_activation",
+        type=str,
+        default="relu",
+        help="Activation applied after the frame projection layer.",
+    )
+    parser.add_argument(
+        "--tcn_dilation_base",
+        type=int,
+        default=2,
+        help="Base of the exponential dilation progression across TemporalConvBlocks.",
+    )
 
     # Data
     parser.add_argument("--training_set_path", type=str, default="", help="Path to the training dataset CSV file")
@@ -37,7 +73,7 @@ def build_training_arg_parser():
                              "gradually enlarging training set experiment from the paper)")
 
     parser.add_argument("--validation_set", type=str, choices=["from-file", "split-from-train", "none"],
-                        default="none", help="Type of validation set construction. See README for further reference")
+                        default="split-from-train", help="Type of validation set construction. See README for further reference")
     parser.add_argument("--validation_set_size", type=float,
                         help="Proportion of the training set to be split as validation set, if 'validation_size' is set"
                              " to 'split-from-train'")
@@ -46,10 +82,29 @@ def build_training_arg_parser():
     # Training hyperparameters
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train the model for")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate for the model training")
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        choices=["sgd", "adamw"],
+        default="sgd",
+        help="Optimizer used for training.",
+    )
+    parser.add_argument(
+        "--sgd_momentum",
+        type=float,
+        default=0.9,
+        help="Momentum term for SGD optimizer.",
+    )
+    parser.add_argument(
+        "--adamw_weight_decay",
+        type=float,
+        default=0.0,
+        help="Weight decay applied by the AdamW optimizer.",
+    )
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size used for training and evaluation dataloaders")
     parser.add_argument("--log_freq", type=int, default=1,
                         help="Log frequency (frequency of printing all the training info)")
-    parser.add_argument("--early_stopping_patience", type=int, default=10,
+    parser.add_argument("--early_stopping_patience", type=int, default=5,
                         help="Number of epochs without validation improvement before stopping early. Set to 0 to disable.")
 
     # Checkpointing
@@ -105,18 +160,33 @@ def _set_random_seeds(seed: int):
 
 
 def _initialize_model(args: argparse.Namespace, sample_shape=None) -> SPOTER:
+    tcn_channels = resolve_tcn_channels(args.tcn_channels)
     model_kwargs = dict(
         num_classes=args.num_classes,
-        hidden_dim=args.hidden_dim,
+        tcn_channels=tcn_channels,
+        dropout=args.tcn_dropout,
+        activation=args.tcn_activation,
+        kernel_size=args.tcn_kernel_size,
+        dilation_base=args.tcn_dilation_base,
     )
 
     model = SPOTER(**model_kwargs)
     return model
 
 
+def _build_optimizer(args: argparse.Namespace) -> tf.keras.optimizers.Optimizer:
+    optimizer_name = args.optimizer.lower()
+    if optimizer_name == "sgd":
+        return tf.keras.optimizers.SGD(learning_rate=args.lr, momentum=args.sgd_momentum)
+    if optimizer_name == "adamw":
+        return tf.keras.optimizers.AdamW(learning_rate=args.lr, weight_decay=args.adamw_weight_decay)
+    raise ValueError(f"Unsupported optimizer '{args.optimizer}'.")
+
+
 def run_training(args):
     _set_random_seeds(args.seed)
     _configure_logging(args)
+    args.tcn_channels = resolve_tcn_channels(args.tcn_channels)
 
     accelerator_type = "GPU" if tf.config.list_physical_devices("GPU") else "CPU"
     print(f"Using {accelerator_type} for training.")
@@ -160,9 +230,11 @@ def run_training(args):
 
     if validation_dataset:
         validation_tf_dataset = validation_dataset.as_tf_dataset(
-            batch_size=args.batch_size,
+            batch_size=1,
             shuffle=False,
             augment=False,
+            pad_to_max_length=False,
+            return_mask=False,
         )
     else:
         validation_tf_dataset = None
@@ -171,9 +243,11 @@ def run_training(args):
 
     if test_dataset:
         test_tf_dataset = test_dataset.as_tf_dataset(
-            batch_size=args.batch_size,
+            batch_size=1,
             shuffle=False,
             augment=False,
+            pad_to_max_length=False,
+            return_mask=False,
         )
     else:
         test_tf_dataset = None
@@ -183,7 +257,7 @@ def run_training(args):
     spoter_model = _initialize_model(args, sample_shape)
 
     loss_function = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-    optimizer = tf.keras.optimizers.SGD(learning_rate=args.lr)
+    optimizer = _build_optimizer(args)
     scheduler = PlateauLearningRateScheduler(optimizer, factor=args.scheduler_factor, patience=args.scheduler_patience)
 
     dummy_input = tf.zeros((1,) + sample_shape, dtype=tf.float32)
