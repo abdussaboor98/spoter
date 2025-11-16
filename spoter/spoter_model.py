@@ -119,9 +119,13 @@ class SPOTER(tf.keras.Model):
 
     def call(self, inputs: tf.Tensor, training: bool = False, mask: Optional[tf.Tensor] = None) -> tf.Tensor:
         inputs = tf.cast(inputs, tf.float32)
-        batch_size = tf.shape(inputs)[0]
-        sequence_length = tf.shape(inputs)[1]
-        flattened_inputs = tf.reshape(inputs, (batch_size, sequence_length, -1))
+        dynamic_shape = tf.shape(inputs)
+        batch_size = dynamic_shape[0]
+        sequence_length = dynamic_shape[1]
+        total_elements = tf.size(inputs)
+        per_frame_dim = tf.math.floordiv(total_elements, tf.maximum(batch_size * sequence_length, 1))
+        flattened_shape = tf.stack([batch_size, sequence_length, per_frame_dim])
+        flattened_inputs = tf.reshape(inputs, flattened_shape)
 
         x = self.input_projection(flattened_inputs)
         x = self.input_activation(x)

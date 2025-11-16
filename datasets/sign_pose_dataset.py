@@ -230,23 +230,42 @@ class SignPoseDataset:
         shuffle: bool = False,
         augment: bool = False,
         gaussian_noise: Optional[Callable[[tf.Tensor], tf.Tensor]] = None,
+        pad_to_max_length: bool = True,
+        return_mask: bool = True,
     ) -> tf.data.Dataset:
         poses = self.pose_sequences
         lengths = self.sequence_lengths
         labels = self.labels
+
+        if not pad_to_max_length and batch_size != 1:
+            raise ValueError("Variable-length batching without padding requires batch_size=1.")
 
         dataset = tf.data.Dataset.from_tensor_slices((poses, lengths, labels))
         if shuffle:
             dataset = dataset.shuffle(buffer_size=self.num_samples, reshuffle_each_iteration=True)
 
         def _map_sample(pose, length, label):
-            pose = tf.ensure_shape(pose, self.input_shape)
-            mask = tf.sequence_mask(length, maxlen=self.max_sequence_length)
-            if augment:
-                pose, mask = self._maybe_augment(pose, mask)
-            if gaussian_noise is not None:
-                pose = gaussian_noise(pose)
-            return {"pose": pose, "mask": mask}, label
+            outputs = {}
+            if pad_to_max_length:
+                pose = tf.ensure_shape(pose, self.input_shape)
+                mask = tf.sequence_mask(length, maxlen=self.max_sequence_length)
+                if augment:
+                    pose, mask = self._maybe_augment(pose, mask)
+                if gaussian_noise is not None:
+                    pose = gaussian_noise(pose)
+                outputs["pose"] = pose
+                if return_mask:
+                    outputs["mask"] = mask
+            else:
+                if augment:
+                    raise ValueError("Temporal augmentations with variable-length batching are not supported.")
+                trimmed_pose = self._trim_pose_to_length(pose, length)
+                if gaussian_noise is not None:
+                    trimmed_pose = gaussian_noise(trimmed_pose)
+                outputs["pose"] = trimmed_pose
+                if return_mask:
+                    raise ValueError("return_mask=True requires pad_to_max_length=True.")
+            return outputs, label
 
         dataset = dataset.map(_map_sample, num_parallel_calls=tf.data.AUTOTUNE)
         dataset = dataset.batch(batch_size, drop_remainder=False)
@@ -388,6 +407,18 @@ class SignPoseDataset:
         pose_dict = pose_tensor_to_dict(frames)
         resampled_dict = resample_sequence(pose_dict, factor)
         return pose_dict_to_array(resampled_dict).astype(np.float32)
+
+    def _trim_pose_to_length(self, pose: tf.Tensor, length: tf.Tensor) -> tf.Tensor:
+        def _trim_numpy(pose_np, length_np):
+            return pose_np[: int(length_np)]
+
+        trimmed = tf.py_function(
+            func=_trim_numpy,
+            inp=[pose, length],
+            Tout=tf.float32,
+        )
+        trimmed.set_shape([None, self.num_joints, 2])
+        return trimmed
 
 
 if __name__ == "__main__":
