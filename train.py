@@ -108,6 +108,17 @@ def build_training_arg_parser():
                         help="Log frequency (frequency of printing all the training info)")
     parser.add_argument("--early_stopping_patience", type=int, default=5,
                         help="Number of epochs without validation improvement before stopping early. Set to 0 to disable.")
+    parser.add_argument(
+        "--enable_qat",
+        action="store_true",
+        help="Enable fake quantization-aware training to simulate INT8 deployment.",
+    )
+    parser.add_argument(
+        "--qat_bits",
+        type=int,
+        default=8,
+        help="Bit-width used by the fake quantization nodes when QAT is enabled.",
+    )
 
     # Checkpointing
     parser.add_argument("--save_checkpoints", type=bool, default=True,
@@ -161,7 +172,7 @@ def _set_random_seeds(seed: int):
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
-def _initialize_model(args: argparse.Namespace, sample_shape=None) -> SPOTER:
+def _initialize_model(args: argparse.Namespace, sample_shape=None, disable_qat: bool = False) -> SPOTER:
     tcn_channels = resolve_tcn_channels(args.tcn_channels)
     model_kwargs = dict(
         num_classes=args.num_classes,
@@ -170,6 +181,8 @@ def _initialize_model(args: argparse.Namespace, sample_shape=None) -> SPOTER:
         activation=args.tcn_activation,
         kernel_size=args.tcn_kernel_size,
         dilation_base=args.tcn_dilation_base,
+        apply_fake_quant=args.enable_qat and not disable_qat,
+        quantization_bits=args.qat_bits,
     )
 
     model = SPOTER(**model_kwargs)
@@ -183,6 +196,16 @@ def _build_optimizer(args: argparse.Namespace) -> tf.keras.optimizers.Optimizer:
     if optimizer_name == "adamw":
         return tf.keras.optimizers.AdamW(learning_rate=args.lr, weight_decay=args.adamw_weight_decay)
     raise ValueError(f"Unsupported optimizer '{args.optimizer}'.")
+
+
+def _export_tflite_model(model: tf.keras.Model, export_path: Path):
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS, tf.lite.OpsSet.SELECT_TF_OPS]
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    tflite_model = converter.convert()
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+    with tf.io.gfile.GFile(str(export_path), "wb") as tflite_file:
+        tflite_file.write(tflite_model)
 
 
 def run_training(args):
@@ -285,6 +308,11 @@ def run_training(args):
     else:
         print("Starting " + args.experiment_name + "...\n\n")
         logging.info("Starting " + args.experiment_name + "...\n\n")
+
+    if args.enable_qat:
+        qat_message = f"Quantization-aware training enabled with {args.qat_bits}-bit fake quantization."
+        print(qat_message)
+        logging.info(qat_message)
 
     if latest_checkpoint_path.exists() and start_epoch > 0:
         spoter_model.load_weights(str(latest_checkpoint_path))
@@ -453,6 +481,16 @@ def run_training(args):
             if export_dir.exists():
                 shutil.rmtree(export_dir)
             tf.saved_model.save(evaluation_model, export_dir)
+            if args.enable_qat:
+                export_model = _initialize_model(args, sample_shape, disable_qat=True)
+                export_model(dummy_input, training=False)
+                export_model.load_weights(str(best_checkpoint_path))
+                frozen_tflite_path = checkpoint_dir / "best_saved_model_qat.tflite"
+                try:
+                    _export_tflite_model(export_model, frozen_tflite_path)
+                    logging.info("Exported frozen QAT TFLite model to %s", frozen_tflite_path)
+                except Exception as exc:  # pragma: no cover
+                    logging.error("Failed to export frozen QAT TFLite model: %s", exc)
             evaluation_model.summary()
         
 

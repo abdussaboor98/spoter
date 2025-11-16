@@ -84,6 +84,8 @@ class SPOTER(tf.keras.Model):
         activation: str = "relu",
         kernel_size: int = 5,
         dilation_base: int = 2,
+        apply_fake_quant: bool = False,
+        quantization_bits: int = 8,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -98,6 +100,8 @@ class SPOTER(tf.keras.Model):
         self.activation_name = activation
         self.kernel_size = kernel_size
         self.dilation_base = dilation_base
+        self.apply_fake_quant = apply_fake_quant
+        self.quantization_bits = int(quantization_bits)
 
         self.input_projection = tf.keras.layers.Dense(
             self.tcn_channels[0],
@@ -117,6 +121,18 @@ class SPOTER(tf.keras.Model):
         self.global_pool = tf.keras.layers.GlobalAveragePooling1D()
         self.classifier = tf.keras.layers.Dense(num_classes)
 
+    def _maybe_fake_quant(self, tensor: tf.Tensor) -> tf.Tensor:
+        if not self.apply_fake_quant:
+            return tensor
+        min_val = tf.reduce_min(tensor)
+        max_val = tf.reduce_max(tensor)
+        return tf.quantization.fake_quant_with_min_max_vars(
+            tensor,
+            min=min_val,
+            max=max_val,
+            num_bits=self.quantization_bits,
+        )
+
     def call(self, inputs: tf.Tensor, training: bool = False, mask: Optional[tf.Tensor] = None) -> tf.Tensor:
         inputs = tf.cast(inputs, tf.float32)
         dynamic_shape = tf.shape(inputs)
@@ -125,12 +141,15 @@ class SPOTER(tf.keras.Model):
         per_frame_dim = dynamic_shape[2] * dynamic_shape[3]
         flattened_shape = tf.stack([batch_size, sequence_length, per_frame_dim])
         flattened_inputs = tf.reshape(inputs, flattened_shape)
+        flattened_inputs = self._maybe_fake_quant(flattened_inputs)
 
         x = self.input_projection(flattened_inputs)
         x = self.input_activation(x)
+        x = self._maybe_fake_quant(x)
 
         for block in self.temporal_blocks:
             x = block(x, training=training)
+            x = self._maybe_fake_quant(x)
 
         if mask is not None:
             float_mask = tf.cast(mask[:, :, tf.newaxis], x.dtype)
@@ -140,9 +159,11 @@ class SPOTER(tf.keras.Model):
             pooled = tf.math.divide_no_nan(summed, valid_counts)
         else:
             pooled = self.global_pool(x)
+        pooled = self._maybe_fake_quant(pooled)
 
         logits = self.classifier(pooled)
         logits = tf.reshape(logits, (batch_size, 1, self.num_classes))
+        logits = self._maybe_fake_quant(logits)
         return logits
 
     def get_config(self):
@@ -155,6 +176,8 @@ class SPOTER(tf.keras.Model):
                 "activation": self.activation_name,
                 "kernel_size": self.kernel_size,
                 "dilation_base": self.dilation_base,
+                "apply_fake_quant": self.apply_fake_quant,
+                "quantization_bits": self.quantization_bits,
             }
         )
         return config
