@@ -1,6 +1,7 @@
 """Utility helpers for training and evaluating the TensorFlow SPOTER model."""
 
 import logging
+import time
 from typing import Optional
 
 import numpy as np
@@ -108,13 +109,16 @@ def train_single_epoch(model: tf.keras.Model, dataset: tf.data.Dataset, loss_fn,
 def evaluate_model(model: tf.keras.Model, dataset: tf.data.Dataset, num_classes: int,
                    print_stats: bool = False):
     correct_predictions, total_predictions = 0, 0
+    total_inference_time = 0.0
     class_level_correct = np.zeros(num_classes, dtype=np.int32)
     class_level_total = np.zeros(num_classes, dtype=np.int32)
 
     for batch_inputs, batch_labels in dataset:
         mask = batch_inputs.get("mask")
         features = batch_inputs["pose"]
+        start_time = time.perf_counter()
         logits = model(features, training=False, mask=mask)
+        total_inference_time += time.perf_counter() - start_time
         logits = tf.squeeze(logits, axis=1)
         predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
 
@@ -141,7 +145,8 @@ def evaluate_model(model: tf.keras.Model, dataset: tf.data.Dataset, num_classes:
         logging.info(str(label_statistics) + "\n")
 
     accuracy = (correct_predictions / total_predictions) if total_predictions else 0.0
-    return correct_predictions, total_predictions, accuracy
+    avg_inference_time = (total_inference_time / total_predictions) if total_predictions else 0.0
+    return correct_predictions, total_predictions, accuracy, avg_inference_time
 
 
 def evaluate_top_k_accuracy(model: tf.keras.Model, dataset: tf.data.Dataset, k: int = 5):

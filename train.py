@@ -4,6 +4,7 @@ import random
 import logging
 import json
 import math
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -312,7 +313,7 @@ def run_training(args):
         training_accuracies.append(training_accuracy)
 
         if has_validation:
-            validation_correct, validation_total, validation_accuracy = evaluate_model(
+            validation_correct, validation_total, validation_accuracy, validation_avg_inference_time = evaluate_model(
                 spoter_model,
                 validation_tf_dataset,
                 args.num_classes,
@@ -326,6 +327,7 @@ def run_training(args):
 
         if has_validation:
             metrics_postfix["val_acc"] = f"{validation_accuracy:.4f}"
+            metrics_postfix["val_inf_ms"] = f"{validation_avg_inference_time * 1000:.2f}"
 
         epoch_bar.set_postfix(metrics_postfix)
 
@@ -354,8 +356,12 @@ def run_training(args):
             logging.info("[" + str(epoch + 1) + "] TRAIN  loss: " + str(epoch_losses[-1]) + " acc: " + str(training_accuracy))
 
             if has_validation:
-                tqdm.write("[" + str(epoch + 1) + "] VALIDATION  acc: " + str(validation_accuracy))
-                logging.info("[" + str(epoch + 1) + "] VALIDATION  acc: " + str(validation_accuracy))
+                validation_message = (
+                    f"[{epoch + 1}] VALIDATION  acc: {validation_accuracy:.4f}  "
+                    f"avg_inf: {validation_avg_inference_time * 1000:.2f} ms"
+                )
+                tqdm.write(validation_message)
+                logging.info(validation_message)
 
             tqdm.write("")
             logging.info("")
@@ -410,26 +416,38 @@ def run_training(args):
                 dummy_input = tf.zeros((1,) + sample_shape, dtype=tf.float32)
                 evaluation_model(dummy_input, training=False)
                 evaluation_model.load_weights(checkpoint_path)
-                _, _, test_accuracy = evaluate_model(evaluation_model, test_tf_dataset, args.num_classes, print_stats=True)
+                _, _, test_accuracy, test_avg_inference_time = evaluate_model(
+                    evaluation_model, test_tf_dataset, args.num_classes, print_stats=True
+                )
 
                 if test_accuracy > best_test_accuracy:
                     best_test_accuracy = test_accuracy
                     best_checkpoint_name = f"{args.experiment_name}/checkpoint_{checkpoint_id}_{i}.weights.h5"
 
-                print(f"checkpoint_{checkpoint_id}_{i}  ->  {test_accuracy}")
-                logging.info(f"checkpoint_{checkpoint_id}_{i}  ->  {test_accuracy}")
+                evaluation_message = (
+                    f"checkpoint_{checkpoint_id}_{i}  ->  acc: {test_accuracy:.4f}  "
+                    f"avg_inf: {test_avg_inference_time * 1000:.2f} ms"
+                )
+                print(evaluation_message)
+                logging.info(evaluation_message)
 
         if best_checkpoint_path.exists():
             evaluation_model = _initialize_model(args)
             dummy_input = tf.zeros((1,) + sample_shape, dtype=tf.float32)
             evaluation_model(dummy_input, training=False)
             evaluation_model.load_weights(str(best_checkpoint_path))
-            _, _, best_checkpoint_accuracy = evaluate_model(evaluation_model, test_tf_dataset, args.num_classes, print_stats=True)
+            _, _, best_checkpoint_accuracy, best_checkpoint_inference = evaluate_model(
+                evaluation_model, test_tf_dataset, args.num_classes, print_stats=True
+            )
             if best_checkpoint_accuracy > best_test_accuracy:
                 best_test_accuracy = best_checkpoint_accuracy
                 best_checkpoint_name = f"{args.experiment_name}/checkpoint_best.weights.h5"
-            print(f"checkpoint_best  ->  {best_checkpoint_accuracy}")
-            logging.info(f"checkpoint_best  ->  {best_checkpoint_accuracy}")
+            best_checkpoint_message = (
+                f"checkpoint_best  ->  acc: {best_checkpoint_accuracy:.4f}  "
+                f"avg_inf: {best_checkpoint_inference * 1000:.2f} ms"
+            )
+            print(best_checkpoint_message)
+            logging.info(best_checkpoint_message)
             export_dir = checkpoint_dir / "best_saved_model"
             if export_dir.exists():
                 shutil.rmtree(export_dir)
