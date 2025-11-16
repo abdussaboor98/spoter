@@ -2,7 +2,7 @@
 
 from typing import List, Optional, Sequence
 
-DEFAULT_TCN_CHANNELS = (1028, 512, 512, 1028)
+DEFAULT_TCN_CHANNELS = (512, 128, 128, 512)
 
 
 def parse_tcn_channels(value: str) -> List[int]:

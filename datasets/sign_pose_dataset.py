@@ -187,7 +187,9 @@ class SignPoseDataset:
             self._normalize_sequences()
 
         if dataset_filename is not None:
-            self.pose_sequences = self.pose_sequences - 0.5
+            for index in range(self.num_samples):
+                length = self.sequence_lengths[index]
+                self.pose_sequences[index, :length] = self.pose_sequences[index, :length] - 0.5
 
     def _normalize_sequences(self):
         normalized_sequences = np.zeros_like(self.pose_sequences)
@@ -253,6 +255,7 @@ class SignPoseDataset:
                     pose, mask = self._maybe_augment(pose, mask)
                 if gaussian_noise is not None:
                     pose = gaussian_noise(pose)
+                    pose = self._apply_mask(pose, mask)
                 outputs["pose"] = pose
                 if return_mask:
                     outputs["mask"] = mask
@@ -409,14 +412,8 @@ class SignPoseDataset:
         return pose_dict_to_array(resampled_dict).astype(np.float32)
 
     def _trim_pose_to_length(self, pose: tf.Tensor, length: tf.Tensor) -> tf.Tensor:
-        def _trim_numpy(pose_np, length_np):
-            return pose_np[: int(length_np)]
-
-        trimmed = tf.py_function(
-            func=_trim_numpy,
-            inp=[pose, length],
-            Tout=tf.float32,
-        )
+        length = tf.cast(length, tf.int32)
+        trimmed = pose[:length]
         trimmed.set_shape([None, self.num_joints, 2])
         return trimmed
 

@@ -3,6 +3,7 @@ import argparse
 import random
 import logging
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -269,6 +270,7 @@ def run_training(args):
     learning_rate_history = list(training_state.get("learning_rate_history", []))
     best_training_accuracy = float(training_state.get("best_training_accuracy", 0))
     best_validation_accuracy = float(training_state.get("best_validation_accuracy", 0))
+    best_validation_loss = float(training_state.get("best_validation_loss", math.inf))
     checkpoint_rotation_index = int(training_state.get("checkpoint_rotation_index", 0))
     epochs_without_improvement = int(training_state.get("epochs_without_improvement", 0))
     start_epoch = int(training_state.get("next_epoch", 0))
@@ -294,6 +296,7 @@ def run_training(args):
 
     epoch_bar = tqdm(range(start_epoch, args.epochs), desc="Epochs", unit="epoch")
     early_stop_epoch = None
+    best_checkpoint_path = checkpoint_dir / "checkpoint_best.weights.h5"
     for epoch in epoch_bar:
         epoch_loss, _, _, training_accuracy = train_single_epoch(
             spoter_model,
@@ -331,13 +334,19 @@ def run_training(args):
             checkpoint_path = f"out-checkpoints/{args.experiment_name}/checkpoint_t_{checkpoint_rotation_index}.weights.h5"
             spoter_model.save_weights(checkpoint_path)
 
-        if has_validation and validation_accuracy > best_validation_accuracy:
-            best_validation_accuracy = validation_accuracy
-            if args.save_checkpoints:
-                checkpoint_path = f"out-checkpoints/{args.experiment_name}/checkpoint_v_{checkpoint_rotation_index}.weights.h5"
-                spoter_model.save_weights(checkpoint_path)
-            epochs_without_improvement = 0
-        elif has_validation and args.early_stopping_patience > 0:
+        if has_validation:
+            better_validation = validation_accuracy > best_validation_accuracy
+            similar_validation = math.isclose(validation_accuracy, best_validation_accuracy)
+            better_loss = epoch_loss < best_validation_loss
+            if better_validation or (similar_validation and better_loss):
+                best_validation_accuracy = validation_accuracy
+                best_validation_loss = epoch_loss
+                if args.save_checkpoints:
+                    spoter_model.save_weights(str(best_checkpoint_path))
+                epochs_without_improvement = 0
+            elif args.early_stopping_patience > 0:
+                epochs_without_improvement += 1
+        elif args.early_stopping_patience > 0:
             epochs_without_improvement += 1
 
         if epoch % args.log_freq == 0:
@@ -370,6 +379,7 @@ def run_training(args):
             "learning_rate_history": learning_rate_history,
             "best_training_accuracy": best_training_accuracy,
             "best_validation_accuracy": best_validation_accuracy,
+            "best_validation_loss": best_validation_loss,
             "checkpoint_rotation_index": checkpoint_rotation_index,
             "epochs_without_improvement": epochs_without_improvement,
             "scheduler_state": scheduler_state,
@@ -409,8 +419,26 @@ def run_training(args):
                 print(f"checkpoint_{checkpoint_id}_{i}  ->  {test_accuracy}")
                 logging.info(f"checkpoint_{checkpoint_id}_{i}  ->  {test_accuracy}")
 
-        print("\nThe top result was recorded at " + str(best_test_accuracy) + " testing accuracy. The best checkpoint is " + best_checkpoint_name + ".")
-        logging.info("\nThe top result was recorded at " + str(best_test_accuracy) + " testing accuracy. The best checkpoint is " + best_checkpoint_name + ".")
+        if best_checkpoint_path.exists():
+            evaluation_model = _initialize_model(args)
+            dummy_input = tf.zeros((1,) + sample_shape, dtype=tf.float32)
+            evaluation_model(dummy_input, training=False)
+            evaluation_model.load_weights(str(best_checkpoint_path))
+            _, _, best_checkpoint_accuracy = evaluate_model(evaluation_model, test_tf_dataset, args.num_classes, print_stats=True)
+            if best_checkpoint_accuracy > best_test_accuracy:
+                best_test_accuracy = best_checkpoint_accuracy
+                best_checkpoint_name = f"{args.experiment_name}/checkpoint_best.weights.h5"
+            print(f"checkpoint_best  ->  {best_checkpoint_accuracy}")
+            logging.info(f"checkpoint_best  ->  {best_checkpoint_accuracy}")
+            export_dir = checkpoint_dir / "best_saved_model"
+            if export_dir.exists():
+                shutil.rmtree(export_dir)
+            tf.saved_model.save(evaluation_model, export_dir)
+        
+
+        summary_message = "\nThe top result was recorded at " + str(best_test_accuracy) + " testing accuracy. The best checkpoint is " + best_checkpoint_name + "."
+        print(summary_message)
+        logging.info(summary_message)
 
     if args.plot_stats:
         fig, ax = plt.subplots()

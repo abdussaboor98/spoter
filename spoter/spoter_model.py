@@ -122,8 +122,7 @@ class SPOTER(tf.keras.Model):
         dynamic_shape = tf.shape(inputs)
         batch_size = dynamic_shape[0]
         sequence_length = dynamic_shape[1]
-        total_elements = tf.size(inputs)
-        per_frame_dim = tf.math.floordiv(total_elements, tf.maximum(batch_size * sequence_length, 1))
+        per_frame_dim = dynamic_shape[2] * dynamic_shape[3]
         flattened_shape = tf.stack([batch_size, sequence_length, per_frame_dim])
         flattened_inputs = tf.reshape(inputs, flattened_shape)
 
